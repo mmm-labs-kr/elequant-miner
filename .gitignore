@@ -2,7 +2,6 @@
 
 # Environment variables (Credentials)
 .env
-.env.example
 
 # Virtual Environment
 venv/
