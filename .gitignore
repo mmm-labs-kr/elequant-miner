@@ -1,0 +1,26 @@
+# Elequant-Miner gitignore
+
+# Environment variables (Credentials)
+.env
+.env.example
+
+# Virtual Environment
+venv/
+ENV/
+env/
+
+# Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local Databases and Research Data
+research/*.db
+research/*.db-journal
+
+# Execution Logs
+logs/*.log
+
+# Operating System Files
+.DS_Store
+Thumbs.db
