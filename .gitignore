@@ -23,3 +23,7 @@ logs/*.log
 # Operating System Files
 .DS_Store
 Thumbs.db
+
+todo.md
+
+.claude/

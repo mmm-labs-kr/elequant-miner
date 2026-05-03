@@ -1,3 +1,4 @@
+import random
 import time
 import logging
 import sys
@@ -114,7 +115,8 @@ class ElequantMiner:
                             detailed = self.wq.get_detailed_stats(alpha_wq_id)
                             
                             if results:
-                                results['detailed'] = detailed # 상세 지표 주입
+                                results['detailed'] = detailed
+                                results['_code'] = slot['code']  # LLM 분석용
                                 self._process_results(slot['alpha_id'], results)
                             
                             logging.info(f"Slot Complete: Alpha {slot['alpha_id']}")
@@ -125,8 +127,10 @@ class ElequantMiner:
                             logging.warning(f"Strategy Error (Alpha {slot['alpha_id']}): {error_msg}")
                             
                             if slot['attempt'] < 2: # 최대 3회 시도 (0, 1, 2)
-                                logging.info(f"Retrying Alpha {slot['alpha_id']} with fix (Attempt {slot['attempt']+1})...")
-                                fixed_code = self._generate_strategy(parent={'code': slot['code']}, error_msg=error_msg)
+                                logging.info(f"Retrying Alpha {slot['alpha_id']} with fix (Attempt {slot['attempt']+1}), quota left: {self.ai.daily_remaining}...")
+                                fixed_code = self._generate_strategy(
+                                    parent={'code': slot['code']}, error_msg=error_msg
+                                )
                                 if fixed_code:
                                     new_sim_url = self.wq.simulate(fixed_code)
                                     if new_sim_url:
@@ -157,50 +161,74 @@ class ElequantMiner:
 
     def _generate_strategy(self, parent=None, error_msg=None):
         """Gemini를 사용하여 전략 생성 또는 에러 수정 (사용자 명령 반영)"""
-        # 관련 데이터 필드 검색 (사용자 명령어가 있으면 해당 키워드 우선 사용)
-        search_keyword = "price"
-        if self.user_directive:
-            # 명령어에서 핵심 키워드 추출 (간단히 공백 기준)
-            search_keyword = self.user_directive.split()[0]
-        
-        import random
-        selected_fields = self.ai.search_fields(search_keyword, limit=20)
-        fields_context = "\nAvailable Data Fields for reference:\n" + "\n".join([f"- {f['id']}: {f['description']}" for f in selected_fields])
+
+
+        # 사용자 지시어에서 키워드 추출, 없으면 None → 엔진의 카테고리 로테이션 사용
+        directive_keyword = self.user_directive.split()[0] if self.user_directive else None
+        selected_fields = self.ai.search_fields(directive_keyword, limit=25)
+        fields_context = "\nAvailable Data Fields:\n" + "\n".join(
+            [f"- {f['id']}: {f['description']}" for f in selected_fields]
+        )
+
+        is_fix = bool(error_msg)
 
         if error_msg:
-            prompt = f"""
-            The following FASTEXPR code produced an error in WorldQuant Brain:
-            Code: {parent['code'] if parent else 'Previous code'}
-            Error: {error_msg}
+            prompt = f"""\
+FASTEXPR code that caused an error in WorldQuant Brain:
+Code: {parent['code'] if parent else 'N/A'}
+Error: {error_msg}
 
-            Please fix the syntax or logical error.
-            {fields_context}
-            Only return the fixed raw FASTEXPR code.
-            """
+Fix the error. Return ONLY the corrected raw FASTEXPR expression.
+{fields_context}"""
+
         elif self.user_directive and not parent:
-            # 사용자가 특정 연구 테마를 입력한 경우 (최우선 순위)
-            prompt = f"""
-            Research Topic: {self.user_directive}
-            
-            Based on this topic, develop a high-quality WorldQuant Alpha factor using FASTEXPR.
-            Focus on the relationships between relevant indicators.
-            {fields_context}
-            """
+            prompt = f"""\
+Research Topic: {self.user_directive}
+
+Create a high-quality WorldQuant Alpha factor using FASTEXPR based on this topic.
+Combine the most relevant data fields in a non-trivial, statistically motivated way.
+Return ONLY the raw FASTEXPR expression.
+{fields_context}"""
+
         elif parent:
-            prompt = f"""
-            Based on the following successful alpha:
-            Code: {parent['code']}
-            Stats: Sharpe {parent['sharpe']}, Fitness {parent['fitness']}, Turnover {parent['turnover']}
+            keys = parent.keys() if hasattr(parent, 'keys') else parent.keys()
+            sharpe   = parent['sharpe']   if 'sharpe'   in keys else '?'
+            fitness  = parent['fitness']  if 'fitness'  in keys else '?'
+            turnover = parent['turnover'] if 'turnover' in keys else '?'
+            analysis = parent['llm_analysis'] if 'llm_analysis' in keys and parent['llm_analysis'] else None
+            analysis_section = f"\nPrevious analysis of this strategy:\n{analysis}\n" if analysis else ""
 
-            Improve this alpha. {"(Focus: " + self.user_directive + ")" if self.user_directive else ""}
-            {fields_context}
-            """
+            prompt = f"""\
+Successful alpha to evolve:
+Code: {parent['code']}
+Sharpe: {sharpe}, Fitness: {fitness}, Turnover: {turnover}
+{analysis_section}
+Evolve this alpha using the analysis above as a guide.
+Possible improvements: change lookback windows, add sector neutralization,
+combine with a complementary signal, or substitute higher-quality data fields.
+{"Focus area: " + self.user_directive if self.user_directive else ""}
+Return ONLY the evolved raw FASTEXPR expression.
+{fields_context}"""
+
         else:
-            theme = random.choice(["Mean Reversion", "Momentum", "Value", "Quality", "Growth"])
-            prompt = f"Create a new alpha factor focusing on {theme} using WorldQuant FASTEXPR.\n{fields_context}"
+            themes = [
+                "Short-term Mean Reversion using price and volume",
+                "Earnings Quality factor using fundamental data",
+                "Momentum with volatility scaling",
+                "Sector-neutral Value factor",
+                "Liquidity-adjusted Growth factor",
+            ]
+            theme = random.choice(themes)
+            prompt = f"""\
+Create a novel WorldQuant Alpha factor based on: {theme}
+Use 2-3 data fields in combination. Make it non-trivial and statistically motivated.
+Return ONLY the raw FASTEXPR expression.
+{fields_context}"""
 
-        logging.info(f"Generating {'fix' if error_msg else ('directed' if self.user_directive else 'auto')} strategy...")
-        return self.ai.generate_alpha(prompt)
+        mode = 'fix' if is_fix else ('directed' if self.user_directive else 'auto')
+        remaining = self.ai.daily_remaining
+        logging.info(f"Generating [{mode}] strategy — daily quota left: gen={remaining['gemini-2.5-flash']}, fix={remaining['gemini-2.5-flash-lite']}")
+        return self.ai.generate_alpha(prompt, is_fix=is_fix)
 
     def _save_alpha(self, code, parent_id):
         conn = sqlite3.connect(self.db.db_path)
@@ -223,83 +251,163 @@ class ElequantMiner:
         conn.close()
 
     def _process_results(self, alpha_id, results):
-        """시뮬레이션 결과 분석 및 DB 저장 (연도별 일관성 체크 포함)"""
-        # 에러 메시지 확인
+        """시뮬레이션 결과 분석 및 DB 저장."""
         if results.get('status') in ['FAILED', 'ERROR']:
             error_msg = results.get('message', 'Unknown error')
-            logging.error(f"Alpha {alpha_id} failed: {error_msg}")
+            logging.error(f"Alpha {alpha_id} simulation error: {error_msg}")
             self._update_alpha_status(alpha_id, f"FAILED: {error_msg[:50]}")
             return False
 
         is_stats = results.get('is', {})
-        sharpe = is_stats.get('sharpe', 0)
-        fitness = is_stats.get('fitness', 0)
+        sharpe   = is_stats.get('sharpe', 0)
+        fitness  = is_stats.get('fitness', 0)
         turnover = is_stats.get('turnover', 0)
-        margin = is_stats.get('margin', 0)
-        
-        # 연도별 일관성 체크 (Yearly Consistency)
+        margin   = is_stats.get('margin', 0)
+
+        # 연도별 일관성 체크
         yearly_pass = True
-        detailed = results.get('detailed', {})
-        if detailed and 'years' in detailed:
+        detailed = results.get('detailed') or {}
+        if 'years' in detailed:
             for year_data in detailed['years']:
                 y_sharpe = year_data.get('sharpe', 0)
                 if y_sharpe < self.criteria['yearly_sharpe_min']:
                     yearly_pass = False
-                    logging.info(f"Alpha {alpha_id} failed yearly check: {year_data.get('year')} Sharpe {y_sharpe}")
+                    logging.info(
+                        f"Alpha {alpha_id} yearly fail: "
+                        f"{year_data.get('year')} Sharpe={y_sharpe:.3f}"
+                    )
                     break
 
         correlations = is_stats.get('correlations', [])
-        max_corr = max([c.get('value', 0) for c in correlations]) if correlations else 0
-        
-        success = (sharpe >= self.criteria['sharpe'] and 
-                   fitness >= self.criteria['fitness'] and 
-                   self.criteria['turnover_min'] <= turnover <= self.criteria['turnover_max'] and
-                   max_corr < self.criteria['correlation_max'] and
-                   yearly_pass)
+        max_corr = max((c.get('value', 0) for c in correlations), default=0)
+
+        # 기준별 통과 여부 계산
+        checks = {
+            "Sharpe":   sharpe  >= self.criteria['sharpe'],
+            "Fitness":  fitness >= self.criteria['fitness'],
+            "Turnover": self.criteria['turnover_min'] <= turnover <= self.criteria['turnover_max'],
+            "MaxCorr":  max_corr < self.criteria['correlation_max'],
+            "Yearly":   yearly_pass,
+        }
+        success = all(checks.values())
+
+        # 실패 기준 상세 로그
+        failed = [k for k, v in checks.items() if not v]
+        if failed:
+            logging.info(
+                f"Alpha {alpha_id} REJECTED — failed: {', '.join(failed)} | "
+                f"Sharpe={sharpe:.3f}, Fitness={fitness:.3f}, "
+                f"Turnover={turnover:.1f}%, MaxCorr={max_corr:.3f}"
+            )
+
+        # 합격 전략 품질 등급 (A: 우수 / B: 양호 / C: 기준 충족)
+        if success:
+            if sharpe >= 1.6 and 10 <= turnover <= 50:
+                status = "PASSED_A"
+            elif sharpe >= 1.4:
+                status = "PASSED_B"
+            else:
+                status = "PASSED_C"
+        elif max_corr >= self.criteria['correlation_max']:
+            status = "REJECTED_BY_CORR"
+        else:
+            status = "REJECTED"
 
         conn = sqlite3.connect(self.db.db_path)
         cursor = conn.cursor()
-        
-        # Metrics 저장
-        cursor.execute("""
-            INSERT INTO metrics (alpha_id, sharpe, turnover, fitness, margin, success_flag)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (alpha_id, sharpe, turnover, fitness, margin, 1 if success else 0))
-        
-        # 상태 업데이트
-        status = "PASSED" if success else "REJECTED"
-        if max_corr >= self.criteria['correlation_max']:
-            status = "REJECTED_BY_CORR"
-            
+        cursor.execute(
+            "INSERT INTO metrics (alpha_id, sharpe, turnover, fitness, margin, success_flag) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (alpha_id, sharpe, turnover, fitness, margin, 1 if success else 0)
+        )
         cursor.execute("UPDATE alphas SET status = ? WHERE id = ?", (status, alpha_id))
-        
-        # 피드백 생성
-        feedback = f"Sharpe: {sharpe}, Max Corr: {max_corr}, Status: {status}"
-        cursor.execute("INSERT INTO feedback (alpha_id, llm_analysis) VALUES (?, ?)", (alpha_id, feedback))
-        
+        # 빈 feedback 행 선점 (LLM 분석 결과는 비동기로 채워짐)
+        cursor.execute("INSERT OR IGNORE INTO feedback (alpha_id) VALUES (?)", (alpha_id,))
         conn.commit()
         conn.close()
-        
-        logging.info(f"Alpha {alpha_id} processed. Status: {status}, Sharpe: {sharpe}")
+
+        logging.info(
+            f"Alpha {alpha_id} → {status} | "
+            f"Sharpe={sharpe:.3f}, Fitness={fitness:.3f}, "
+            f"Turnover={turnover:.1f}%, MaxCorr={max_corr:.3f}"
+        )
+
+        # LLM 결과 분석 및 DB 저장 (루프를 막지 않도록 결과만 저장)
+        self._store_llm_analysis(alpha_id, results.get('_code', ''), sharpe, fitness,
+                                 turnover, margin, max_corr, yearly_pass, status, checks)
+        return success
+
+    def _store_llm_analysis(self, alpha_id, code, sharpe, fitness,
+                            turnover, margin, max_corr, yearly_pass, status, checks):
+        """LLM에게 결과를 분석시키고 feedback 테이블에 저장."""
+        failed_lines = [
+            f"  - {k}: {v}" for k, v in {
+                "Sharpe": f"{sharpe:.3f} (need ≥{self.criteria['sharpe']})",
+                "Fitness": f"{fitness:.3f} (need ≥{self.criteria['fitness']})",
+                "Turnover": f"{turnover:.1f}% (need {self.criteria['turnover_min']}-{self.criteria['turnover_max']}%)",
+                "MaxCorr": f"{max_corr:.3f} (need <{self.criteria['correlation_max']})",
+                "Yearly Sharpe": f"{'pass' if yearly_pass else 'fail'}",
+            }.items() if not checks.get(k.split()[0], True)
+        ]
+        failed_section = ("Failed criteria:\n" + "\n".join(failed_lines)) if failed_lines else "All criteria passed."
+
+        prompt = f"""\
+Alpha FASTEXPR Code:
+{code if code else '(not recorded)'}
+
+Result: {status}
+Sharpe={sharpe:.3f}, Fitness={fitness:.3f}, Turnover={turnover:.1f}%, Margin={margin:.4f}, MaxCorr={max_corr:.3f}
+{failed_section}
+
+Analyze: What structural feature of this alpha drove the result?
+What specific sub-expression changes would most improve the weakest metric?"""
+
+        analysis = self.ai.analyze_result(prompt)
+        if analysis:
+            conn = sqlite3.connect(self.db.db_path)
+            conn.execute(
+                "UPDATE feedback SET llm_analysis = ? WHERE alpha_id = ?",
+                (analysis, alpha_id)
+            )
+            conn.commit()
+            conn.close()
+            logging.info(f"Alpha {alpha_id} LLM analysis stored.")
 
     def _get_best_parent(self):
-        """DB에서 가장 성과가 좋은 합격 전략 중 하나를 선택하여 진화의 기반으로 삼음"""
+        """합격 전략 중 품질 점수 상위 5개에서 가중 랜덤 선택.
+
+        quality_score = Sharpe × Fitness / (1 + |turnover - 25| / 25)
+        — Sharpe와 Fitness가 높고 Turnover가 25% 근처일수록 높은 점수.
+        """
         conn = sqlite3.connect(self.db.db_path)
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         cursor.execute("""
-            SELECT a.id, a.code, m.sharpe, m.fitness, m.turnover 
-            FROM alphas a JOIN metrics m ON a.id = m.alpha_id 
-            WHERE m.success_flag = 1 
-            ORDER BY m.sharpe DESC LIMIT 5
+            SELECT a.id, a.code, m.sharpe, m.fitness, m.turnover, f.llm_analysis,
+                   (m.sharpe * m.fitness) / (1.0 + ABS(m.turnover - 25.0) / 25.0) AS quality_score
+            FROM alphas a
+            JOIN metrics m ON a.id = m.alpha_id
+            LEFT JOIN feedback f ON a.id = f.alpha_id
+            WHERE m.success_flag = 1
+            ORDER BY quality_score DESC
+            LIMIT 5
         """)
         rows = cursor.fetchall()
         conn.close()
-        
-        if rows:
-            import random
-            return rows[random.randint(0, len(rows)-1)]
-        return None
+
+        if not rows:
+            return None
+
+        # 상위 전략일수록 더 자주 선택되도록 가중치 부여 (rank 1 → weight 5, rank 5 → weight 1)
+        weights = list(range(len(rows), 0, -1))
+        total = sum(weights)
+        r = random.random() * total
+        cumulative = 0
+        for row, w in zip(rows, weights):
+            cumulative += w
+            if r <= cumulative:
+                return row
+        return rows[0]
 
 if __name__ == "__main__":
     email = os.getenv("WQ_EMAIL")
