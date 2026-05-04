@@ -33,6 +33,11 @@ class DBManager:
                 fitness REAL,
                 margin REAL,
                 drawdown REAL,
+                returns REAL,
+                sub_sharpe REAL,
+                max_corr REAL,
+                quality_score REAL,
+                failed_checks TEXT,
                 region TEXT,
                 universe TEXT,
                 success_flag INTEGER,
@@ -49,7 +54,6 @@ class DBManager:
             )
         ''')
 
-        # Tracks parent→child lineage for strategy evolution trees
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS lineage (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -61,22 +65,70 @@ class DBManager:
             )
         ''')
 
-        # Indexes for the most frequent query patterns
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS yearly_metrics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                alpha_id INTEGER NOT NULL,
+                year INTEGER NOT NULL,
+                sharpe REAL,
+                turnover REAL,
+                fitness REAL,
+                returns REAL,
+                drawdown REAL,
+                margin REAL,
+                long_count INTEGER,
+                short_count INTEGER,
+                UNIQUE(alpha_id, year),
+                FOREIGN KEY (alpha_id) REFERENCES alphas (id)
+            )
+        ''')
+
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_alphas_status ON alphas (status)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_alphas_parent ON alphas (parent_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_metrics_success ON metrics (success_flag)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_metrics_sharpe ON metrics (sharpe DESC)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_lineage_parent ON lineage (parent_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_yearly_alpha ON yearly_metrics (alpha_id)')
 
-        # Schema migration: add columns if they were missing in an older DB
         for col, ddl in [
             ("user_hypothesis", "INTEGER DEFAULT 0"),
             ("hypothesis_text", "TEXT"),
+            ("sim_url",         "TEXT"),
+            ("wq_alpha_id",     "TEXT"),
+            ("source",          "TEXT DEFAULT 'miner'"),
         ]:
             try:
                 cursor.execute(f"ALTER TABLE alphas ADD COLUMN {col} {ddl}")
             except sqlite3.OperationalError:
                 pass
+
+        for col, ddl in [
+            ("returns",       "REAL"),
+            ("sub_sharpe",    "REAL"),
+            ("max_corr",      "REAL"),
+            ("quality_score", "REAL"),
+            ("failed_checks", "TEXT"),
+        ]:
+            try:
+                cursor.execute(f"ALTER TABLE metrics ADD COLUMN {col} {ddl}")
+            except sqlite3.OperationalError:
+                pass
+
+        # 기존 PASSED_A/B/C → PASSED 정규화
+        cursor.execute(
+            "UPDATE alphas SET status = 'PASSED' WHERE status IN ('PASSED_A', 'PASSED_B', 'PASSED_C')"
+        )
+
+        # 기존 PASSED 행에 quality_score 백필
+        cursor.execute("""
+            UPDATE metrics
+            SET quality_score = ROUND(
+                (sharpe * fitness) / (1.0 + ABS(turnover - 25) / 25.0), 4
+            )
+            WHERE success_flag = 1
+              AND sharpe > 0 AND fitness > 0
+              AND quality_score IS NULL
+        """)
 
         conn.commit()
         conn.close()

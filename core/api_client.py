@@ -108,6 +108,26 @@ class WQClient:
         logging.error(f"Failed to fetch alpha results for {alpha_id} after {MAX_RETRIES} attempts.")
         return None
 
+    def list_alphas(self, limit: int = 100) -> list[dict]:
+        """Fetch user's alpha history from WQ Brain. Returns list of alpha dicts."""
+        results = []
+        offset = 0
+        while True:
+            url = f"{self.base_url}/alphas?type=REGULAR&limit={limit}&offset={offset}"
+            response = self.session.get(url)
+            if self._relogin_if_needed(response):
+                continue
+            if response.status_code != 200:
+                logging.error(f"list_alphas failed: {response.status_code}")
+                break
+            data = response.json()
+            batch = data.get("results", data if isinstance(data, list) else [])
+            results.extend(batch)
+            if len(batch) < limit:
+                break
+            offset += limit
+        return results
+
     def get_detailed_stats(self, alpha_id):
         """Fetch per-year breakdown with retry on transient failures."""
         url = f"{self.base_url}/alphas/{alpha_id}/check"

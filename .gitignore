@@ -16,6 +16,7 @@ __pycache__/
 # Local Databases and Research Data
 research/*.db
 research/*.db-journal
+research/*.md
 
 # Execution Logs
 logs/*.log

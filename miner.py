@@ -1,169 +1,287 @@
 import random
 import time
 import logging
-import sys
 import sqlite3
 import os
-from pathlib import Path
 from dotenv import load_dotenv
+from rich.console import Console
+from rich.logging import RichHandler
+from rich.panel import Panel
+from rich.table import Table
+from rich import box
 
-# 내부 모듈 임포트
 from core.db_manager import DBManager
 from core.ai_engine import GeminiEngine
 from core.api_client import WQClient
-from utils.paths import DB_PATH, ENV_FILE, LOGS_DIR
+from utils.dedup_manager import DedupManager
+from utils.paths import DB_PATH, ENV_FILE, LOGS_DIR, DATA_DIR
 
-# 프로그램 시작 시 .env 로드 (단 한 번만 수행)
 load_dotenv(ENV_FILE)
 
-# 로깅 설정
+console = Console()
+
+# 파일은 타임스탬프 포함 전체 포맷, 터미널은 rich 렌더링
+file_handler = logging.FileHandler(LOGS_DIR / "miner.log", encoding='utf-8')
+file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
+    force=True,
     handlers=[
-        logging.FileHandler(LOGS_DIR / "miner.log"),
-        logging.StreamHandler(sys.stdout)
+        file_handler,
+        RichHandler(console=console, show_path=False, markup=True, rich_tracebacks=True),
     ]
 )
+
 
 class ElequantMiner:
     def __init__(self, email, password):
         self.db = DBManager(str(DB_PATH))
         self.ai = GeminiEngine()
         self.wq = WQClient()
+        self.dedup = DedupManager(DATA_DIR / "shared_tried.json")
         self.email = email
         self.password = password
-        self.user_directive = None # 오늘의 특수 연구 명령
-        
-        # 합격 기준 설정 (IQC 기준 바탕)
+        self.user_directive = None
+        self._gen_round = 0  # 0=PASSED발전, 1=near-miss개선, 2=신규탐색
+
         self.criteria = {
             "sharpe": 1.25,
             "fitness": 1.0,
             "turnover_min": 1.0,
             "turnover_max": 70.0,
             "correlation_max": 0.7,
-            "yearly_sharpe_min": 0.1 # 연도별 최소 Sharpe 기준
+            "yearly_sharpe_min": 0.1,
         }
 
     def run(self):
-        """메인 마이닝 루프 (3개 슬롯 병렬 관리)"""
-        # 시작 시 사용자 연구 테마 입력받기
-        print("\n" + "="*50)
-        print("💡 Elequant-Miner Research Guide Mode")
-        print("오늘 연구하고 싶은 테마나 지표 명령어를 입력하세요.")
-        print("(예: '배당수익률과 부채비율을 엮어줘', 'RSI 리버전 전략 집중 연구')")
-        print("그냥 엔터를 치면 'Full Auto' 모드로 동작합니다.")
-        print("="*50)
+        console.print(Panel(
+            "[bold cyan]오늘 연구하고 싶은 테마나 지표를 입력하세요.[/]\n"
+            "[dim](예: '배당수익률과 부채비율을 엮어줘', 'RSI 리버전 전략')[/]\n"
+            "[dim]엔터만 치면 Full Auto 모드로 동작합니다.[/]",
+            title="[bold]💡 Elequant-Miner[/]",
+            border_style="cyan",
+        ))
         self.user_directive = input("입력: ").strip() or None
 
         if not self.wq.login(self.email, self.password):
-            logging.error("Failed to initialize miner due to login failure.")
+            logging.error("Login failed.")
             return
 
-        logging.info("🚀 Elequant-Miner started successfully! (Parallel Slots: 3)")
-        
-        # 슬롯 관리 (최대 3개)
-        # 각 슬롯: {'sim_url': str, 'alpha_id': int, 'attempt': int, 'code': str, 'parent_alpha': dict}
-        slots = []
+        logging.info(
+            f"🚀 Miner started! Slots: 3 | "
+            f"Dedup pool: [cyan]{self.dedup.count}[/] known strategies"
+        )
+
+        slots = self._resume_pending()
         max_slots = 3
+        session_stats = {"tried": 0, "passed": 0, "failed": 0}
+        gen_retry_after = 0.0  # rate limit backoff 타이머
 
         try:
             while True:
-                # 1. 빈 슬롯 채우기
+                # 빈 슬롯 채우기 — 3-mode 로테이션
+                # mode 0: PASSED 발전, mode 1: near-miss 개선, mode 2: 신규 탐색
                 while len(slots) < max_slots:
-                    parent_alpha = self._get_best_parent()
-                    alpha_code = self._generate_strategy(parent_alpha)
-                    
-                    if not alpha_code:
-                        logging.warning("Strategy generation paused due to API limits. Waiting 60s...")
-                        time.sleep(60) # 대기 시간 30s -> 60s로 증가
-                        break 
+                    if time.time() < gen_retry_after:
+                        remaining = gen_retry_after - time.time()
+                        logging.info(f"Generation rate-limited — {remaining:.0f}s 후 재시도")
+                        break
 
+                    mode = self._gen_round % 3
+                    self._gen_round += 1
+
+                    if mode == 0:
+                        parent_alpha = self._get_best_parent()
+                        is_nearmiss = False
+                        mode_label = "PASSED 발전" if parent_alpha else "신규 탐색(fallback)"
+                    elif mode == 1:
+                        parent_alpha = self._get_nearmiss_parent()
+                        is_nearmiss = True
+                        mode_label = "near-miss 개선" if parent_alpha else "신규 탐색(fallback)"
+                        if not parent_alpha:
+                            is_nearmiss = False
+                    else:
+                        parent_alpha = None
+                        is_nearmiss = False
+                        mode_label = "신규 탐색"
+
+                    gen_result = self._generate_strategy(parent_alpha, is_nearmiss=is_nearmiss)
+
+                    if not gen_result:
+                        gen_retry_after = time.time() + 60
+                        logging.warning("Generation rate-limited — 60s 후 재시도 (슬롯 폴링 계속)")
+                        break
+
+                    alpha_code, alpha_settings = gen_result
+
+                    if self.dedup.is_duplicate(alpha_code):
+                        logging.info("[yellow]⚠ Duplicate strategy detected — skipping[/]")
+                        continue
+
+                    self.dedup.add(alpha_code)
                     alpha_id = self._save_alpha(alpha_code, parent_alpha['id'] if parent_alpha else None)
-                    sim_url = self.wq.simulate(alpha_code)
-                    
+                    sim_url = self.wq.simulate(alpha_code, alpha_settings or None)
+
                     if sim_url:
+                        self._save_sim_url(alpha_id, sim_url)
+                        settings_str = ", ".join(f"{k}={v}" for k, v in alpha_settings.items()) if alpha_settings else "default"
                         slots.append({
                             'sim_url': sim_url,
                             'alpha_id': alpha_id,
                             'attempt': 0,
                             'code': alpha_code,
-                            'parent_alpha': parent_alpha
+                            'parent_alpha': parent_alpha,
+                            'submitted_at': time.time(),
+                            'last_heartbeat': 0,
+                            'last_progress': -1,
                         })
-                        # 슬롯 채우기 간격 추가 (API 과부하 방지)
-                        time.sleep(15) # 10s -> 15s로 증가하여 더 여유 있게 운영
+                        session_stats["tried"] += 1
+                        logging.info(
+                            f"Slot {len(slots)}/3 | [bold]#{alpha_id}[/] "
+                            f"[dim]{mode_label}[/] ({settings_str})"
+                        )
+                        time.sleep(15)
                     else:
-                        logging.error(f"Failed to start simulation for Alpha {alpha_id}")
-                
-                # 2. 모든 슬롯 상태 체크 (진행률 확인)
-                for slot in slots[:]: # 복사본으로 루프 (항목 제거 대비)
+                        logging.error(f"Simulation start failed for Alpha #{alpha_id}")
+
+                # 슬롯 상태 체크
+                for slot in slots[:]:
                     try:
-                        # WQ 서버 상태 확인 (비동기처럼 작동하도록 1회만 get 수행)
                         response = self.wq.session.get(slot['sim_url'])
                         if response.status_code != 200:
-                            logging.error(f"Slot Error ({response.status_code}): {slot['sim_url']}")
+                            logging.error(f"Slot HTTP {response.status_code}: {slot['sim_url']}")
                             slots.remove(slot)
                             continue
-                            
+
                         data = response.json()
                         progress = data.get("progress", 0)
                         status = data.get("status")
-                        
-                        if progress == 1.0:
+
+                        if status in ("COMPLETE", "WARNING") or progress == 1.0:
                             alpha_wq_id = data.get("alpha")
                             results = self.wq.get_alpha_results(alpha_wq_id)
                             detailed = self.wq.get_detailed_stats(alpha_wq_id)
-                            
+
                             if results:
                                 results['detailed'] = detailed
-                                results['_code'] = slot['code']  # LLM 분석용
-                                self._process_results(slot['alpha_id'], results)
-                            
-                            logging.info(f"Slot Complete: Alpha {slot['alpha_id']}")
+                                results['_code'] = slot['code']
+                                passed = self._process_results(slot['alpha_id'], results)
+                                if passed:
+                                    session_stats["passed"] += 1
+                                else:
+                                    session_stats["failed"] += 1
+
                             slots.remove(slot)
-                            
+                            self._print_session_stats(session_stats)
+
                         elif status in ["FAILED", "ERROR"]:
                             error_msg = data.get("message", "Unknown error")
-                            logging.warning(f"Strategy Error (Alpha {slot['alpha_id']}): {error_msg}")
-                            
-                            if slot['attempt'] < 2: # 최대 3회 시도 (0, 1, 2)
-                                logging.info(f"Retrying Alpha {slot['alpha_id']} with fix (Attempt {slot['attempt']+1}), quota left: {self.ai.daily_remaining}...")
-                                fixed_code = self._generate_strategy(
+                            logging.warning(
+                                f"[yellow]⚠ Alpha #{slot['alpha_id']} Error:[/] {error_msg}\n"
+                                f"  Code: {slot['code'][:120]}"
+                            )
+
+                            if slot['attempt'] < 2:
+                                logging.info(
+                                    f"🔧 Retrying Alpha #{slot['alpha_id']} "
+                                    f"(attempt {slot['attempt']+1}/3)"
+                                )
+                                fix_result = self._generate_strategy(
                                     parent={'code': slot['code']}, error_msg=error_msg
                                 )
-                                if fixed_code:
+                                if fix_result:
+                                    fixed_code, _ = fix_result
                                     new_sim_url = self.wq.simulate(fixed_code)
                                     if new_sim_url:
+                                        self._save_sim_url(slot['alpha_id'], new_sim_url)
                                         slot['sim_url'] = new_sim_url
                                         slot['code'] = fixed_code
                                         slot['attempt'] += 1
                                         continue
-                            
-                            # 재시도 실패 또는 한도 초과
+
                             self._update_alpha_status(slot['alpha_id'], f"FAILED: {error_msg[:50]}")
+                            session_stats["failed"] += 1
                             slots.remove(slot)
+
                         else:
-                            # 아직 진행 중
-                            pass
+                            elapsed = time.time() - slot.get('submitted_at', time.time())
+                            last_progress = slot.get('last_progress', -1)
+                            time_since_update = time.time() - slot.get('last_heartbeat', 0)
+                            # 진행률 5% 이상 변화 or 2분마다 게이지 갱신
+                            if progress - last_progress >= 0.05 or (elapsed > 30 and time_since_update > 120):
+                                self._print_progress(slot['alpha_id'], progress, elapsed)
+                                slot['last_progress'] = progress
+                                slot['last_heartbeat'] = time.time()
 
                     except Exception as e:
-                        logging.error(f"Error checking slot: {e}")
-                
+                        logging.error(f"Slot check error: {e}")
+
                 if not slots:
-                    time.sleep(10) # 모든 슬롯이 비었으면 잠시 대기
+                    time.sleep(10)
                 else:
-                    time.sleep(15) # 슬롯 체크 간격
+                    time.sleep(15)
 
         except KeyboardInterrupt:
-            logging.info("\n🛑 Stop signal received. Shutting down Elequant-Miner...")
-            logging.info(f"Ongoing simulations: {len(slots)} are still running on WQ server.")
-            logging.info("You can check their progress on the WQ Brain website later.")
+            console.print(Panel(
+                f"[bold]진행 중인 시뮬레이션:[/] {len(slots)}개 — WQ 서버에서 계속 실행 중\n"
+                f"[bold]이번 세션:[/] "
+                f"시도 {session_stats['tried']} | "
+                f"[green]합격 {session_stats['passed']}[/] | "
+                f"[red]실패 {session_stats['failed']}[/]\n"
+                "[dim]결과는 WQ Brain 웹사이트 또는 대시보드에서 확인하세요.[/]",
+                title="[bold yellow]🛑 종료[/]",
+                border_style="yellow",
+            ))
 
-    def _generate_strategy(self, parent=None, error_msg=None):
-        """Gemini를 사용하여 전략 생성 또는 에러 수정 (사용자 명령 반영)"""
+    def _resume_pending(self) -> list:
+        """이전 세션에서 PENDING 상태로 남은 시뮬레이션을 복구."""
+        conn = sqlite3.connect(self.db.db_path)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT id, code, sim_url FROM alphas "
+            "WHERE status = 'PENDING' AND sim_url IS NOT NULL"
+        ).fetchall()
+        conn.close()
+        if not rows:
+            return []
+        logging.info(f"이전 세션 PENDING [cyan]{len(rows)}[/]개 복구 중...")
+        return [
+            {
+                'sim_url': r['sim_url'],
+                'alpha_id': r['id'],
+                'attempt': 3,
+                'code': r['code'],
+                'parent_alpha': None,
+                'submitted_at': time.time() - 300,
+                'last_heartbeat': 0,
+                'last_progress': -1,
+            }
+            for r in rows
+        ]
 
+    @staticmethod
+    def _print_progress(alpha_id: int, progress: float, elapsed: float):
+        bar_width = 24
+        filled = int(progress * bar_width)
+        bar = '█' * filled + '░' * (bar_width - filled)
+        pct = f"{progress * 100:5.1f}%"
+        label = "대기 중" if progress == 0 else pct
+        console.print(
+            f"  ⏳ Alpha [bold]#{alpha_id}[/]  [{bar}] {label}  "
+            f"({elapsed / 60:.1f}분 경과)",
+            highlight=False,
+        )
 
-        # 사용자 지시어에서 키워드 추출, 없으면 None → 엔진의 카테고리 로테이션 사용
+    def _print_session_stats(self, stats):
+        t = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
+        t.add_row("이번 세션", "")
+        t.add_row("  시도", str(stats["tried"]))
+        t.add_row("  합격", f"[green]{stats['passed']}[/]")
+        t.add_row("  실패", f"[red]{stats['failed']}[/]")
+        console.print(t)
+
+    def _generate_strategy(self, parent=None, error_msg=None, is_nearmiss=False):
         directive_keyword = self.user_directive.split()[0] if self.user_directive else None
         selected_fields = self.ai.search_fields(directive_keyword, limit=25)
         fields_context = "\nAvailable Data Fields:\n" + "\n".join(
@@ -181,6 +299,46 @@ Error: {error_msg}
 Fix the error. Return ONLY the corrected raw FASTEXPR expression.
 {fields_context}"""
 
+        elif is_nearmiss and parent:
+            keys = parent.keys()
+            sharpe   = parent['sharpe']   if 'sharpe'   in keys else 0
+            fitness  = parent['fitness']  if 'fitness'  in keys else 0
+            turnover = parent['turnover'] if 'turnover' in keys else 0
+            failed   = parent['failed_checks'] if 'failed_checks' in keys else ""
+            analysis = parent['llm_analysis']  if 'llm_analysis'  in keys and parent['llm_analysis'] else None
+
+            # 어느 기준이 얼마나 부족한지 정량화
+            gaps = []
+            if isinstance(sharpe,  (int, float)) and sharpe  < 1.25:
+                gaps.append(f"Sharpe {sharpe:.3f} → need ≥1.25 (gap {1.25-sharpe:.3f})")
+            if isinstance(fitness, (int, float)) and fitness < 1.0:
+                gaps.append(f"Fitness {fitness:.3f} → need ≥1.0 (gap {1.0-fitness:.3f})")
+            if isinstance(turnover,(int, float)) and turnover < 1.0:
+                gaps.append(f"Turnover {turnover:.1f}% → need ≥1% (too low)")
+            if isinstance(turnover,(int, float)) and turnover > 70.0:
+                gaps.append(f"Turnover {turnover:.1f}% → need ≤70% (too high, reduce decay or increase universe)")
+            gap_text = "\n".join(f"  - {g}" for g in gaps) if gaps else f"  (check failed_checks: {failed})"
+
+            prompt = f"""\
+Near-miss alpha that barely failed WQ Brain criteria:
+Code: {parent['code']}
+Metrics: Sharpe={sharpe}, Fitness={fitness}, Turnover={turnover}%
+{f'Previous LLM analysis: {analysis}' if analysis else ''}
+
+Failing criteria (make TARGETED fixes for these only):
+{gap_text}
+
+Rules:
+- Change ONLY what's needed to fix the failing criteria
+- Do NOT touch parts that are already working
+- If Sharpe is too low: try stronger normalization, better signal combination, or sub-industry neutralization
+- If Fitness is too low: add ts_zscore/rank for consistency, reduce lookback variance
+- If Turnover is too high: increase decay parameter, use slower-moving signals
+- If Turnover is too low: shorten lookback windows, use higher-frequency signals
+{"Focus: " + self.user_directive if self.user_directive else ""}
+Return ONLY the corrected raw FASTEXPR expression.
+{fields_context}"""
+
         elif self.user_directive and not parent:
             prompt = f"""\
 Research Topic: {self.user_directive}
@@ -191,20 +349,19 @@ Return ONLY the raw FASTEXPR expression.
 {fields_context}"""
 
         elif parent:
-            keys = parent.keys() if hasattr(parent, 'keys') else parent.keys()
-            sharpe   = parent['sharpe']   if 'sharpe'   in keys else '?'
-            fitness  = parent['fitness']  if 'fitness'  in keys else '?'
-            turnover = parent['turnover'] if 'turnover' in keys else '?'
+            keys = parent.keys()
+            sharpe   = parent['sharpe']       if 'sharpe'       in keys else '?'
+            fitness  = parent['fitness']      if 'fitness'      in keys else '?'
+            turnover = parent['turnover']     if 'turnover'     in keys else '?'
             analysis = parent['llm_analysis'] if 'llm_analysis' in keys and parent['llm_analysis'] else None
-            analysis_section = f"\nPrevious analysis of this strategy:\n{analysis}\n" if analysis else ""
+            analysis_section = f"\nPrevious analysis:\n{analysis}\n" if analysis else ""
 
             prompt = f"""\
 Successful alpha to evolve:
 Code: {parent['code']}
 Sharpe: {sharpe}, Fitness: {fitness}, Turnover: {turnover}
 {analysis_section}
-Evolve this alpha using the analysis above as a guide.
-Possible improvements: change lookback windows, add sector neutralization,
+Evolve this alpha: change lookback windows, add sector neutralization,
 combine with a complementary signal, or substitute higher-quality data fields.
 {"Focus area: " + self.user_directive if self.user_directive else ""}
 Return ONLY the evolved raw FASTEXPR expression.
@@ -225,23 +382,47 @@ Use 2-3 data fields in combination. Make it non-trivial and statistically motiva
 Return ONLY the raw FASTEXPR expression.
 {fields_context}"""
 
-        mode = 'fix' if is_fix else ('directed' if self.user_directive else 'auto')
+        if is_fix:
+            mode = 'fix'
+        elif is_nearmiss:
+            mode = 'near-miss'
+        elif parent:
+            mode = 'evolve'
+        elif self.user_directive:
+            mode = 'directed'
+        else:
+            mode = 'explore'
+
         remaining = self.ai.daily_remaining
-        logging.info(f"Generating [{mode}] strategy — daily quota left: gen={remaining['gemini-2.5-flash']}, fix={remaining['gemini-2.5-flash-lite']}")
-        return self.ai.generate_alpha(prompt, is_fix=is_fix)
+        logging.info(
+            f"Generating [bold]{mode}[/] — "
+            f"quota gen={remaining['gemini-2.5-flash']} "
+            f"fix={remaining['gemini-2.5-flash-lite']}"
+        )
+        return self.ai.generate_alpha(prompt, is_fix=is_fix)  # (code, settings) | None
 
     def _save_alpha(self, code, parent_id):
         conn = sqlite3.connect(self.db.db_path)
         cursor = conn.cursor()
         user_hypo = 1 if self.user_directive else 0
-        cursor.execute("""
-            INSERT INTO alphas (code, parent_id, user_hypothesis, hypothesis_text) 
-            VALUES (?, ?, ?, ?)
-        """, (code, parent_id, user_hypo, self.user_directive))
+        cursor.execute(
+            "INSERT INTO alphas (code, parent_id, user_hypothesis, hypothesis_text) "
+            "VALUES (?, ?, ?, ?)",
+            (code, parent_id, user_hypo, self.user_directive)
+        )
         alpha_id = cursor.lastrowid
         conn.commit()
         conn.close()
         return alpha_id
+
+    def _save_sim_url(self, alpha_id, sim_url):
+        """Store simulation URL so results can be recovered after restart."""
+        conn = sqlite3.connect(self.db.db_path)
+        conn.execute(
+            "UPDATE alphas SET sim_url = ? WHERE id = ?", (sim_url, alpha_id)
+        )
+        conn.commit()
+        conn.close()
 
     def _update_alpha_status(self, alpha_id, status):
         conn = sqlite3.connect(self.db.db_path)
@@ -250,65 +431,67 @@ Return ONLY the raw FASTEXPR expression.
         conn.commit()
         conn.close()
 
+    CRITICAL_CHECKS = {
+        'LOW_SHARPE', 'LOW_FITNESS', 'LOW_TURNOVER', 'HIGH_TURNOVER',
+        'LOW_SUB_UNIVERSE_SHARPE', 'SELF_CORRELATION', 'CONCENTRATED_WEIGHT',
+    }
+
     def _process_results(self, alpha_id, results):
-        """시뮬레이션 결과 분석 및 DB 저장."""
         if results.get('status') in ['FAILED', 'ERROR']:
             error_msg = results.get('message', 'Unknown error')
-            logging.error(f"Alpha {alpha_id} simulation error: {error_msg}")
+            logging.error(f"Alpha #{alpha_id} simulation error: {error_msg}")
             self._update_alpha_status(alpha_id, f"FAILED: {error_msg[:50]}")
             return False
 
         is_stats = results.get('is', {})
         sharpe   = is_stats.get('sharpe', 0)
         fitness  = is_stats.get('fitness', 0)
-        turnover = is_stats.get('turnover', 0)
-        margin   = is_stats.get('margin', 0)
+        turnover = (is_stats.get('turnover') or 0) * 100  # API: 소수 → %
+        margin   = is_stats.get('margin', 0) or 0
+        returns  = is_stats.get('returns') or is_stats.get('annualizedReturns')
 
-        # 연도별 일관성 체크
-        yearly_pass = True
-        detailed = results.get('detailed') or {}
-        if 'years' in detailed:
-            for year_data in detailed['years']:
-                y_sharpe = year_data.get('sharpe', 0)
-                if y_sharpe < self.criteria['yearly_sharpe_min']:
-                    yearly_pass = False
-                    logging.info(
-                        f"Alpha {alpha_id} yearly fail: "
-                        f"{year_data.get('year')} Sharpe={y_sharpe:.3f}"
-                    )
-                    break
+        # WQ Brain /check 결과를 직접 사용 (7개 기준 전부 반영)
+        detailed   = results.get('detailed') or {}
+        check_list = (detailed.get('is') or {}).get('checks', [])
+        check_map  = {c['name']: c for c in check_list}
 
-        correlations = is_stats.get('correlations', [])
-        max_corr = max((c.get('value', 0) for c in correlations), default=0)
-
-        # 기준별 통과 여부 계산
-        checks = {
-            "Sharpe":   sharpe  >= self.criteria['sharpe'],
-            "Fitness":  fitness >= self.criteria['fitness'],
-            "Turnover": self.criteria['turnover_min'] <= turnover <= self.criteria['turnover_max'],
-            "MaxCorr":  max_corr < self.criteria['correlation_max'],
-            "Yearly":   yearly_pass,
-        }
-        success = all(checks.values())
-
-        # 실패 기준 상세 로그
-        failed = [k for k, v in checks.items() if not v]
-        if failed:
-            logging.info(
-                f"Alpha {alpha_id} REJECTED — failed: {', '.join(failed)} | "
-                f"Sharpe={sharpe:.3f}, Fitness={fitness:.3f}, "
-                f"Turnover={turnover:.1f}%, MaxCorr={max_corr:.3f}"
+        if check_map:
+            success = all(
+                check_map.get(name, {}).get('result', 'PASS') == 'PASS'
+                for name in self.CRITICAL_CHECKS
             )
+            failed_keys = [
+                c['name'] for c in check_list
+                if c.get('result') == 'FAIL' and c['name'] in self.CRITICAL_CHECKS
+            ]
+            max_corr  = check_map.get('SELF_CORRELATION', {}).get('value') or 0
+            sub_sharpe = check_map.get('LOW_SUB_UNIVERSE_SHARPE', {}).get('value')
+        else:
+            # 폴백: 수동 기준 (Sharpe/Fitness/Turnover/MaxCorr)
+            correlations = is_stats.get('correlations', [])
+            max_corr = max((c.get('value', 0) for c in correlations), default=0)
+            sub_sharpe = None
+            success = (
+                sharpe  >= self.criteria['sharpe']
+                and fitness  >= self.criteria['fitness']
+                and self.criteria['turnover_min'] <= turnover <= self.criteria['turnover_max']
+                and max_corr < self.criteria['correlation_max']
+            )
+            failed_keys = [k for k, v in {
+                'LOW_SHARPE':    sharpe  >= self.criteria['sharpe'],
+                'LOW_FITNESS':   fitness >= self.criteria['fitness'],
+                'LOW_TURNOVER':  turnover >= self.criteria['turnover_min'],
+                'HIGH_TURNOVER': turnover <= self.criteria['turnover_max'],
+                'SELF_CORRELATION': max_corr < self.criteria['correlation_max'],
+            }.items() if not v]
 
-        # 합격 전략 품질 등급 (A: 우수 / B: 양호 / C: 기준 충족)
+        quality_score = round(
+            (sharpe * fitness) / (1.0 + abs(turnover - 25) / 25.0), 4
+        ) if (sharpe > 0 and fitness > 0) else 0.0
+
         if success:
-            if sharpe >= 1.6 and 10 <= turnover <= 50:
-                status = "PASSED_A"
-            elif sharpe >= 1.4:
-                status = "PASSED_B"
-            else:
-                status = "PASSED_C"
-        elif max_corr >= self.criteria['correlation_max']:
+            status = "PASSED"
+        elif 'SELF_CORRELATION' in failed_keys:
             status = "REJECTED_BY_CORR"
         else:
             status = "REJECTED"
@@ -316,40 +499,83 @@ Return ONLY the raw FASTEXPR expression.
         conn = sqlite3.connect(self.db.db_path)
         cursor = conn.cursor()
         cursor.execute(
-            "INSERT INTO metrics (alpha_id, sharpe, turnover, fitness, margin, success_flag) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (alpha_id, sharpe, turnover, fitness, margin, 1 if success else 0)
+            "INSERT INTO metrics "
+            "(alpha_id, sharpe, turnover, fitness, margin, returns, sub_sharpe, max_corr, "
+            " quality_score, failed_checks, success_flag) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (alpha_id, sharpe, turnover, fitness, margin,
+             returns, sub_sharpe, max_corr,
+             quality_score,
+             ",".join(failed_keys) if failed_keys else None,
+             1 if success else 0)
         )
         cursor.execute("UPDATE alphas SET status = ? WHERE id = ?", (status, alpha_id))
-        # 빈 feedback 행 선점 (LLM 분석 결과는 비동기로 채워짐)
         cursor.execute("INSERT OR IGNORE INTO feedback (alpha_id) VALUES (?)", (alpha_id,))
+        self._store_yearly_metrics(alpha_id, detailed, cursor)
         conn.commit()
         conn.close()
 
-        logging.info(
-            f"Alpha {alpha_id} → {status} | "
-            f"Sharpe={sharpe:.3f}, Fitness={fitness:.3f}, "
-            f"Turnover={turnover:.1f}%, MaxCorr={max_corr:.3f}"
+        metrics_line = (
+            f"Sharpe=[bold]{sharpe:.3f}[/]  "
+            f"Fitness={fitness:.3f}  "
+            f"Turnover={turnover:.1f}%  "
+            f"MaxCorr={max_corr:.3f}"
         )
 
-        # LLM 결과 분석 및 DB 저장 (루프를 막지 않도록 결과만 저장)
-        self._store_llm_analysis(alpha_id, results.get('_code', ''), sharpe, fitness,
-                                 turnover, margin, max_corr, yearly_pass, status, checks)
+        if success:
+            console.print(Panel(
+                metrics_line,
+                title=f"[bold green]✅ Alpha #{alpha_id} → {status}[/]",
+                border_style="green",
+            ))
+        else:
+            console.print(Panel(
+                f"{metrics_line}\n[red]실패 기준:[/] {', '.join(failed_keys)}",
+                title=f"[bold red]❌ Alpha #{alpha_id} → {status}[/]",
+                border_style="red",
+            ))
+
+        self._store_llm_analysis(
+            alpha_id, results.get('_code', ''),
+            sharpe, fitness, turnover, margin, max_corr, failed_keys, status
+        )
         return success
 
+    @staticmethod
+    def _store_yearly_metrics(alpha_id: int, detailed: dict, cursor):
+        """WQ Brain /check 응답의 연도별 데이터를 yearly_metrics 테이블에 저장."""
+        is_data = (detailed or {}).get('is') or {}
+        yearly = []
+        for key in ('stats', 'yearlyStats', 'annualStats', 'yearly', 'performance'):
+            candidate = is_data.get(key)
+            if isinstance(candidate, list) and candidate:
+                yearly = candidate
+                break
+        for y in yearly:
+            year = y.get('year') or y.get('yr')
+            if not year:
+                continue
+            turnover_raw = y.get('turnover')
+            turnover_pct = turnover_raw * 100 if turnover_raw is not None and turnover_raw < 2 else turnover_raw
+            cursor.execute(
+                """INSERT OR IGNORE INTO yearly_metrics
+                   (alpha_id, year, sharpe, turnover, fitness, returns, drawdown, margin, long_count, short_count)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (alpha_id, int(year),
+                 y.get('sharpe'), turnover_pct,
+                 y.get('fitness'),
+                 y.get('returns') or y.get('annualizedReturns'),
+                 y.get('drawdown') or y.get('maxDrawdown'),
+                 y.get('margin'),
+                 y.get('longCount') or y.get('long_count'),
+                 y.get('shortCount') or y.get('short_count'))
+            )
+
     def _store_llm_analysis(self, alpha_id, code, sharpe, fitness,
-                            turnover, margin, max_corr, yearly_pass, status, checks):
-        """LLM에게 결과를 분석시키고 feedback 테이블에 저장."""
-        failed_lines = [
-            f"  - {k}: {v}" for k, v in {
-                "Sharpe": f"{sharpe:.3f} (need ≥{self.criteria['sharpe']})",
-                "Fitness": f"{fitness:.3f} (need ≥{self.criteria['fitness']})",
-                "Turnover": f"{turnover:.1f}% (need {self.criteria['turnover_min']}-{self.criteria['turnover_max']}%)",
-                "MaxCorr": f"{max_corr:.3f} (need <{self.criteria['correlation_max']})",
-                "Yearly Sharpe": f"{'pass' if yearly_pass else 'fail'}",
-            }.items() if not checks.get(k.split()[0], True)
-        ]
-        failed_section = ("Failed criteria:\n" + "\n".join(failed_lines)) if failed_lines else "All criteria passed."
+                            turnover, margin, max_corr, failed_keys, status):
+        failed_section = (
+            "Failed criteria:\n" + "\n".join(f"  - {k}" for k in failed_keys)
+        ) if failed_keys else "All criteria passed."
 
         prompt = f"""\
 Alpha FASTEXPR Code:
@@ -359,7 +585,7 @@ Result: {status}
 Sharpe={sharpe:.3f}, Fitness={fitness:.3f}, Turnover={turnover:.1f}%, Margin={margin:.4f}, MaxCorr={max_corr:.3f}
 {failed_section}
 
-Analyze: What structural feature of this alpha drove the result?
+Analyze: What structural feature drove this result?
 What specific sub-expression changes would most improve the weakest metric?"""
 
         analysis = self.ai.analyze_result(prompt)
@@ -371,14 +597,9 @@ What specific sub-expression changes would most improve the weakest metric?"""
             )
             conn.commit()
             conn.close()
-            logging.info(f"Alpha {alpha_id} LLM analysis stored.")
+            logging.info(f"Alpha #{alpha_id} LLM analysis stored.")
 
     def _get_best_parent(self):
-        """합격 전략 중 품질 점수 상위 5개에서 가중 랜덤 선택.
-
-        quality_score = Sharpe × Fitness / (1 + |turnover - 25| / 25)
-        — Sharpe와 Fitness가 높고 Turnover가 25% 근처일수록 높은 점수.
-        """
         conn = sqlite3.connect(self.db.db_path)
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
@@ -398,7 +619,6 @@ What specific sub-expression changes would most improve the weakest metric?"""
         if not rows:
             return None
 
-        # 상위 전략일수록 더 자주 선택되도록 가중치 부여 (rank 1 → weight 5, rank 5 → weight 1)
         weights = list(range(len(rows), 0, -1))
         total = sum(weights)
         r = random.random() * total
@@ -409,13 +629,53 @@ What specific sub-expression changes would most improve the weakest metric?"""
                 return row
         return rows[0]
 
+    def _get_nearmiss_parent(self):
+        """합격 기준에 가장 근접한 REJECTED 전략을 부모로 반환.
+
+        각 기준까지의 정규화 갭 합산이 가장 작은 것을 선택:
+          nearmiss_score = -(sharpe_gap/1.25 + fitness_gap/1.0 + turnover_penalty)
+        높을수록(0에 가까울수록) 합격에 가깝다.
+        """
+        conn = sqlite3.connect(self.db.db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT a.id, a.code, m.sharpe, m.fitness, m.turnover,
+                   m.failed_checks, f.llm_analysis,
+                   -(
+                     MAX(0.0, 1.25 - COALESCE(m.sharpe,   0)) / 1.25 +
+                     MAX(0.0, 1.0  - COALESCE(m.fitness,  0)) / 1.0  +
+                     CASE
+                       WHEN m.turnover BETWEEN 1 AND 70 THEN 0.0
+                       WHEN m.turnover < 1  THEN (1  - m.turnover) / 1.0
+                       ELSE                      (m.turnover - 70) / 70.0
+                     END
+                   ) AS nearmiss_score
+            FROM alphas a
+            JOIN metrics m ON a.id = m.alpha_id
+            LEFT JOIN feedback f ON a.id = f.alpha_id
+            WHERE a.status = 'REJECTED'
+              AND m.sharpe   > 0.6
+              AND m.fitness  > 0.3
+              AND m.turnover BETWEEN 0.1 AND 200
+            ORDER BY nearmiss_score DESC
+            LIMIT 10
+        """)
+        rows = cursor.fetchall()
+        conn.close()
+
+        if not rows:
+            return None
+        # 상위 5개 중 랜덤 선택 (과도한 집중 방지)
+        return random.choice(rows[:5])
+
+
 if __name__ == "__main__":
     email = os.getenv("WQ_EMAIL")
     password = os.getenv("WQ_PASSWORD")
-    
+
     if not email or not password:
-        print("Error: WQ_EMAIL or WQ_PASSWORD not found in environment variables.")
-        print("Please check your .env file or environment settings.")
+        console.print("[bold red]Error:[/] WQ_EMAIL or WQ_PASSWORD not found in .env file.")
     else:
         miner = ElequantMiner(email, password)
         miner.run()

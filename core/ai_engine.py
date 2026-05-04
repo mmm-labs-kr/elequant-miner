@@ -7,7 +7,6 @@ from datetime import datetime, timedelta, date
 from google import genai
 from utils.paths import ENV_FILE, OPERATORS_JSON, DATAFIELDS_JSON, DATA_DIR
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 GEN_MODEL = "gemini-2.5-flash"
 FIX_MODEL = "gemini-2.5-flash-lite"
@@ -26,13 +25,13 @@ FIELD_CATEGORIES = [
 ]
 
 FASTEXPR_EXAMPLES = """\
-Good FASTEXPR Alpha Examples:
-1. Momentum:       rank(ts_mean(close / ts_delay(close, 1) - 1, 20))
-2. Mean Reversion: -rank(ts_delta(close, 5)) * (1 / (rank(stddev(close, 20)) + 0.001))
-3. Value:          scale(group_zscore(earnings / market_cap, sector))
-4. Volume Surge:   rank(volume / ts_mean(volume, 20)) * rank(ts_delta(close, 1))
-5. Quality:        -rank(ts_mean(total_debt / equity, 60)) + rank(ts_mean(net_income / equity, 60))
-6. Reversal:       -ts_rank(close, 5) + rank(ts_mean(close, 60))
+Correct FASTEXPR examples — study the argument counts carefully:
+1. Momentum:       rank(ts_mean(returns, 20))
+2. Mean Reversion: -rank(ts_delta(close, 5))
+3. Volume Surge:   rank(volume / ts_mean(volume, 20))
+4. Sector Neutral: group_zscore(ts_mean(returns, 60), sector)
+5. Reversal:       -ts_rank(close, 20)
+6. Combined:       rank(ts_mean(returns, 20)) - rank(ts_std_dev(returns, 20))
 """
 
 
@@ -90,7 +89,7 @@ class GeminiEngine:
         self.api_key = os.getenv("GEMINI_API_KEY")
         self.client = genai.Client(api_key=self.api_key)
 
-        self._gen_quota = _ModelQuota(GEN_RPM, GEN_RPD, min_interval=8)
+        self._gen_quota = _ModelQuota(GEN_RPM, GEN_RPD, min_interval=15)
         self._fix_quota = _ModelQuota(FIX_RPM, FIX_RPD, min_interval=3)
         self._category_idx = 0
 
@@ -99,7 +98,17 @@ class GeminiEngine:
         with open(DATAFIELDS_JSON, 'r', encoding='utf-8') as f:
             self.datafields = json.load(f)
 
+        self._operator_ref = self._build_operator_reference()
         self._load_quota_state()
+
+    def _build_operator_reference(self) -> str:
+        by_cat: dict[str, list[str]] = {}
+        for op in self.operators:
+            by_cat.setdefault(op['category'], []).append(op['definition'])
+        lines = []
+        for cat, defs in by_cat.items():
+            lines.append(f"[{cat}] " + "  ".join(defs))
+        return "\n".join(lines)
 
     # ------------------------------------------------------------------ quota persistence
 
@@ -166,44 +175,113 @@ class GeminiEngine:
             return False
         if code.count('(') != code.count(')'):
             return False
-        known_fn = ('rank(', 'ts_', 'stddev(', 'scale(', 'group_', 'log(',
-                    'abs(', 'if_else(', 'exp(')
+        if re.search(r'\d[eE][+-]?\d', code):
+            return False  # scientific notation not supported
+        known_fn = ('rank(', 'ts_', 'scale(', 'group_', 'log(',
+                    'abs(', 'if_else(', 'zscore(')
         return any(fn in code for fn in known_fn)
 
     @staticmethod
     def _clean(raw: str) -> str:
         code = re.sub(r'```(?:[a-zA-Z]+)?\n?', '', raw).replace('```', '').strip().strip("'\"")
-        code = re.sub(r'ts_stddev\(', 'stddev(', code)
-        code = re.sub(r'\bstdev\(', 'stddev(', code)
+        code = re.sub(r'\bts_stddev\(', 'ts_std_dev(', code)
+        code = re.sub(r'\bstddev\(', 'ts_std_dev(', code)
+        code = re.sub(r'\bstdev\(', 'ts_std_dev(', code)
         code = re.sub(r'mul\(([^,]+),\s*([^)]+)\)', r'(\1 * \2)', code)
         code = re.sub(r'div\(([^,]+),\s*([^)]+)\)', r'(\1 / \2)', code)
         code = re.sub(r'add\(([^,]+),\s*([^)]+)\)', r'(\1 + \2)', code)
         code = re.sub(r'sub\(([^,]+),\s*([^)]+)\)', r'(\1 - \2)', code)
+        # rank/zscore/scale/normalize accept only 1 mandatory arg;
+        # strip trailing float literal (e.g. rank(x, 0.001) → rank(x))
+        code = re.sub(r'\b(rank|zscore|scale|normalize)\(([^,)]+),\s*\d*\.\d+\)', r'\1(\2)', code)
+        # FASTEXPR does not support scientific notation — convert to decimal
+        code = re.sub(
+            r'\d+(?:\.\d+)?[eE][+-]?\d+',
+            lambda m: format(float(m.group(0)), 'f').rstrip('0').rstrip('.') or '0',
+            code
+        )
         return code
 
-    def generate_alpha(self, prompt_context: str, is_fix: bool = False) -> str | None:
-        """Generate or fix a FASTEXPR alpha. Uses FIX_MODEL when is_fix=True to conserve quota."""
+    _VALID_UNIVERSES = {"TOP3000", "TOP2000", "TOP1000", "TOP500", "TOP200", "TOPSP500"}
+    _VALID_NEUTRALIZATIONS = {"NONE", "MARKET", "SECTOR", "INDUSTRY", "SUBINDUSTRY"}
+
+    def _parse_response(self, raw: str) -> tuple[str, dict]:
+        """Try to parse JSON response; fall back to treating the whole thing as code."""
+        cleaned = re.sub(r'```(?:[a-zA-Z]*)?\n?', '', raw).replace('```', '').strip()
+        try:
+            data = json.loads(cleaned)
+            code = self._clean(str(data.get('code', '')))
+            settings = {}
+            if 'decay' in data:
+                v = int(data['decay'])
+                if 1 <= v <= 512:
+                    settings['decay'] = v
+            if 'truncation' in data:
+                v = float(data['truncation'])
+                if 0.0 < v <= 1.0:
+                    settings['truncation'] = round(v, 4)
+            if 'universe' in data:
+                v = str(data['universe']).upper()
+                if v in self._VALID_UNIVERSES:
+                    settings['universe'] = v
+            if 'neutralization' in data:
+                v = str(data['neutralization']).upper()
+                if v in self._VALID_NEUTRALIZATIONS:
+                    settings['neutralization'] = v
+            if 'pasteurization' in data:
+                v = str(data['pasteurization']).upper()
+                if v in ('ON', 'OFF'):
+                    settings['pasteurization'] = v
+            if 'nanHandling' in data:
+                v = str(data['nanHandling']).upper()
+                if v in ('ON', 'OFF'):
+                    settings['nanHandling'] = v
+            return code, settings
+        except (json.JSONDecodeError, ValueError, TypeError):
+            return self._clean(cleaned), {}
+
+    def generate_alpha(self, prompt_context: str, is_fix: bool = False) -> tuple[str, dict] | None:
+        """Generate or fix a FASTEXPR alpha. Returns (code, settings_override) or None."""
         model = FIX_MODEL if is_fix else GEN_MODEL
         quota = self._fix_quota if is_fix else self._gen_quota
 
+        if is_fix:
+            output_section = (
+                "=== OUTPUT ===\n"
+                "Return ONLY the raw FASTEXPR expression. No markdown, no explanation, no comments."
+            )
+        else:
+            output_section = """\
+=== OUTPUT (JSON only, no markdown) ===
+Return a single JSON object with these keys:
+- "code": the FASTEXPR expression (required)
+- "decay": integer 1-512; short signals 3-10, medium 10-20, slow fundamental 20-40
+- "truncation": float 0.02-0.20; concentrated → 0.04-0.06, diffuse → 0.08-0.15
+- "universe": TOP3000 (default) | TOP2000 | TOP1000 | TOP500 | TOP200 | TOPSP500
+- "neutralization": SUBINDUSTRY (default) | INDUSTRY | SECTOR | MARKET | NONE
+
+Example: {"code": "rank(ts_mean(returns, 20))", "decay": 10, "truncation": 0.08, "universe": "TOP3000", "neutralization": "SUBINDUSTRY"}"""
+
         system_instruction = f"""\
-You are an expert Quantitative Researcher at WorldQuant.
-Generate high-quality Alpha factors using WorldQuant's FASTEXPR language.
+You are an expert Quantitative Researcher generating WorldQuant Brain FASTEXPR alpha factors.
 
-FASTEXPR Rules:
-- Arithmetic: +  -  *  /  ^ (power)
-- Functions: log(x), exp(x), abs(x)
-- Time-series (integer lookback t): ts_sum(x,t) ts_mean(x,t) stddev(x,t) ts_rank(x,t) ts_delta(x,t) ts_delay(x,t)
-- Cross-sectional: rank(x) scale(x) group_mean(x,g) group_zscore(x,g)
-- Conditional: if_else(condition, true_val, false_val)
+=== COMPLETE OPERATOR REFERENCE (use ONLY these) ===
+{self._operator_ref}
 
-Critical rules:
-- Use stddev(x,t) NOT ts_stddev — this is the most common error
-- Every open parenthesis must have a matching close parenthesis
-- Use exact field IDs from the provided list (e.g. close, volume, earnings)
-- Output ONLY the raw FASTEXPR expression — no markdown, no explanation
+=== STRICT ARGUMENT RULES ===
+- d (lookback) must be a POSITIVE INTEGER: ts_mean(x, 20) ✓  ts_mean(x, 0.5) ✗
+- rank(x) takes 1 arg; optional rate must be 0 or 2 (integer): rank(x) ✓  rank(x, 0.001) ✗
+- zscore(x) takes exactly 1 arg: zscore(x) ✓  zscore(x, 0.001) ✗
+- scale(x) takes exactly 1 mandatory arg: scale(x) ✓
+- normalize(x) takes exactly 1 mandatory arg
+- ts_std_dev(x,d) is the ONLY standard deviation function — stddev() and ts_stddev() do NOT exist
+- group_mean(x, weight, group) requires ALL 3 args
+- group values: sector, industry, subindustry
+- To avoid division by zero use decimal notation ONLY: x / (abs(y) + 0.000001) — NEVER use 1e-6 or any scientific notation (FASTEXPR does not support it)
 
-{FASTEXPR_EXAMPLES}"""
+{FASTEXPR_EXAMPLES}
+
+{output_section}"""
 
         max_retries = 3
         for attempt in range(max_retries):
@@ -214,20 +292,25 @@ Critical rules:
                     contents=prompt_context,
                     config={'system_instruction': system_instruction}
                 )
-                code = self._clean(response.text.strip())
+                raw = response.text.strip()
                 self._save_quota_state()
+
+                if is_fix:
+                    code = self._clean(raw)
+                    settings: dict = {}
+                else:
+                    code, settings = self._parse_response(raw)
+
                 if self._validate(code):
-                    return code
+                    return code, settings
                 logging.warning(f"Validation failed (attempt {attempt+1}): {code[:100]}")
             except Exception as e:
                 err = str(e)
                 if "429" in err or "RESOURCE_EXHAUSTED" in err:
-                    wait_sec = min(60 * (2 ** attempt), 300)
-                    logging.info(f"429 received. Backoff: {wait_sec}s (attempt {attempt+1})...")
-                    time.sleep(wait_sec)
-                else:
-                    logging.error(f"Gemini API error: {e}")
-                    return None
+                    logging.info("Rate limited (429) — caller will handle backoff.")
+                    return None  # 슬립 없이 즉시 반환, 슬롯 폴링 차단 방지
+                logging.error(f"Gemini API error: {e}")
+                return None
         logging.error("Max retries exceeded for alpha generation.")
         return None
 
