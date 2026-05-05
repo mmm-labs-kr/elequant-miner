@@ -304,37 +304,58 @@ Fix the error. Return ONLY the corrected raw FASTEXPR expression.
             sharpe   = parent['sharpe']   if 'sharpe'   in keys else 0
             fitness  = parent['fitness']  if 'fitness'  in keys else 0
             turnover = parent['turnover'] if 'turnover' in keys else 0
-            failed   = parent['failed_checks'] if 'failed_checks' in keys else ""
+            failed_str = parent['failed_checks'] if 'failed_checks' in keys else ""
+            failed_set = set(failed_str.split(',')) if failed_str else set()
             analysis = parent['llm_analysis']  if 'llm_analysis'  in keys and parent['llm_analysis'] else None
 
-            # 어느 기준이 얼마나 부족한지 정량화
-            gaps = []
-            if isinstance(sharpe,  (int, float)) and sharpe  < 1.25:
-                gaps.append(f"Sharpe {sharpe:.3f} → need ≥1.25 (gap {1.25-sharpe:.3f})")
-            if isinstance(fitness, (int, float)) and fitness < 1.0:
-                gaps.append(f"Fitness {fitness:.3f} → need ≥1.0 (gap {1.0-fitness:.3f})")
-            if isinstance(turnover,(int, float)) and turnover < 1.0:
-                gaps.append(f"Turnover {turnover:.1f}% → need ≥1% (too low)")
-            if isinstance(turnover,(int, float)) and turnover > 70.0:
-                gaps.append(f"Turnover {turnover:.1f}% → need ≤70% (too high, reduce decay or increase universe)")
-            gap_text = "\n".join(f"  - {g}" for g in gaps) if gaps else f"  (check failed_checks: {failed})"
+            # 실패한 각 체크에 대해 수치 gap + 구체적 개선 안내 생성
+            fail_lines = []
+            if 'LOW_SHARPE' in failed_set and isinstance(sharpe, (int, float)):
+                fail_lines.append(
+                    f"- LOW_SHARPE: {sharpe:.3f} → need ≥1.25 (gap {1.25-sharpe:.3f})\n"
+                    f"  Fix: wrap with group_zscore(..., subindustry), add complementary signal, or use ts_zscore for consistency"
+                )
+            if 'LOW_FITNESS' in failed_set and isinstance(fitness, (int, float)):
+                fail_lines.append(
+                    f"- LOW_FITNESS: {fitness:.3f} → need ≥1.0 (gap {1.0-fitness:.3f})\n"
+                    f"  Fix: add rank()/ts_zscore() to stabilize signal year-over-year, reduce lookback variance, or use ts_decay_linear"
+                )
+            if 'LOW_TURNOVER' in failed_set and isinstance(turnover, (int, float)):
+                fail_lines.append(
+                    f"- LOW_TURNOVER: {turnover:.1f}% → need ≥1%\n"
+                    f"  Fix: shorten lookback windows, use faster signals (returns, volume), or remove ts_decay_linear"
+                )
+            if 'HIGH_TURNOVER' in failed_set and isinstance(turnover, (int, float)):
+                fail_lines.append(
+                    f"- HIGH_TURNOVER: {turnover:.1f}% → need ≤70%\n"
+                    f"  Fix: increase decay parameter (try 15-30), use ts_decay_linear, switch to slower fundamental signals"
+                )
+            if 'LOW_SUB_UNIVERSE_SHARPE' in failed_set:
+                fail_lines.append(
+                    f"- LOW_SUB_UNIVERSE_SHARPE: signal breaks down on smaller stock subsets\n"
+                    f"  Fix: add group_zscore(..., subindustry) or group_neutralize to reduce sector bias; "
+                    f"try universe=TOP1000 for tighter coverage; avoid signals that only work on large-caps"
+                )
+            if 'CONCENTRATED_WEIGHT' in failed_set:
+                fail_lines.append(
+                    f"- CONCENTRATED_WEIGHT: positions too concentrated in a few stocks\n"
+                    f"  Fix: wrap the final expression with rank() or zscore() to spread weights evenly; "
+                    f"use winsorize(x, std=3) to cap outliers; avoid log() or power() on raw values without normalization"
+                )
+            if not fail_lines:
+                fail_lines.append(f"- failed_checks: {failed_str} (see above for context)")
+
+            fail_text = "\n".join(fail_lines)
 
             prompt = f"""\
-Near-miss alpha that barely failed WQ Brain criteria:
+Near-miss alpha — passed {7 - len(failed_set)}/7 WQ Brain checks, failing only:
 Code: {parent['code']}
 Metrics: Sharpe={sharpe}, Fitness={fitness}, Turnover={turnover}%
 {f'Previous LLM analysis: {analysis}' if analysis else ''}
 
-Failing criteria (make TARGETED fixes for these only):
-{gap_text}
+=== FAILING CHECKS — fix ONLY these, leave passing parts untouched ===
+{fail_text}
 
-Rules:
-- Change ONLY what's needed to fix the failing criteria
-- Do NOT touch parts that are already working
-- If Sharpe is too low: try stronger normalization, better signal combination, or sub-industry neutralization
-- If Fitness is too low: add ts_zscore/rank for consistency, reduce lookback variance
-- If Turnover is too high: increase decay parameter, use slower-moving signals
-- If Turnover is too low: shorten lookback windows, use higher-frequency signals
 {"Focus: " + self.user_directive if self.user_directive else ""}
 Return ONLY the corrected raw FASTEXPR expression.
 {fields_context}"""
@@ -632,9 +653,9 @@ What specific sub-expression changes would most improve the weakest metric?"""
     def _get_nearmiss_parent(self):
         """합격 기준에 가장 근접한 REJECTED 전략을 부모로 반환.
 
-        각 기준까지의 정규화 갭 합산이 가장 작은 것을 선택:
-          nearmiss_score = -(sharpe_gap/1.25 + fitness_gap/1.0 + turnover_penalty)
-        높을수록(0에 가까울수록) 합격에 가깝다.
+        정렬 우선순위:
+          1. 실패 체크 수 오름차순 (1개 탈락 > 2개 탈락 > ...)
+          2. 수치 기준 갭 합산 오름차순 (sharpe/fitness/turnover 기준 근접도)
         """
         conn = sqlite3.connect(self.db.db_path)
         conn.row_factory = sqlite3.Row
@@ -642,7 +663,11 @@ What specific sub-expression changes would most improve the weakest metric?"""
         cursor.execute("""
             SELECT a.id, a.code, m.sharpe, m.fitness, m.turnover,
                    m.failed_checks, f.llm_analysis,
-                   -(
+                   CASE
+                     WHEN m.failed_checks IS NULL THEN 0
+                     ELSE (LENGTH(m.failed_checks) - LENGTH(REPLACE(m.failed_checks, ',', ''))) + 1
+                   END AS failed_count,
+                   (
                      MAX(0.0, 1.25 - COALESCE(m.sharpe,   0)) / 1.25 +
                      MAX(0.0, 1.0  - COALESCE(m.fitness,  0)) / 1.0  +
                      CASE
@@ -650,7 +675,7 @@ What specific sub-expression changes would most improve the weakest metric?"""
                        WHEN m.turnover < 1  THEN (1  - m.turnover) / 1.0
                        ELSE                      (m.turnover - 70) / 70.0
                      END
-                   ) AS nearmiss_score
+                   ) AS numeric_gap
             FROM alphas a
             JOIN metrics m ON a.id = m.alpha_id
             LEFT JOIN feedback f ON a.id = f.alpha_id
@@ -658,7 +683,7 @@ What specific sub-expression changes would most improve the weakest metric?"""
               AND m.sharpe   > 0.6
               AND m.fitness  > 0.3
               AND m.turnover BETWEEN 0.1 AND 200
-            ORDER BY nearmiss_score DESC
+            ORDER BY failed_count ASC, numeric_gap ASC
             LIMIT 10
         """)
         rows = cursor.fetchall()
