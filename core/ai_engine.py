@@ -32,6 +32,8 @@ Correct FASTEXPR examples — study the argument counts carefully:
 4. Sector Neutral: group_zscore(ts_mean(returns, 60), sector)
 5. Reversal:       -ts_rank(close, 20)
 6. Combined:       rank(ts_mean(returns, 20)) - rank(ts_std_dev(returns, 20))
+7. Conditional:    if_else(or(greater(returns, 0), less(ts_mean(volume,5), 1000)), rank(close), -rank(close))
+8. Safe divide:    divide(close, add(high, add(low, 0.000001)))
 """
 
 
@@ -194,6 +196,11 @@ class GeminiEngine:
         # rank/zscore/scale/normalize accept only 1 mandatory arg;
         # strip trailing float literal (e.g. rank(x, 0.001) → rank(x))
         code = re.sub(r'\b(rank|zscore|scale|normalize)\(([^,)]+),\s*\d*\.\d+\)', r'\1(\2)', code)
+        # gt()/lt()/ge()/le() are not FASTEXPR operators — replace with correct names
+        code = re.sub(r'\bgt\(', 'greater(', code)
+        code = re.sub(r'\blt\(', 'less(', code)
+        code = re.sub(r'\bge\(', 'greater_equal(', code)
+        code = re.sub(r'\ble\(', 'less_equal(', code)
         # FASTEXPR does not support scientific notation — convert to decimal
         code = re.sub(
             r'\d+(?:\.\d+)?[eE][+-]?\d+',
@@ -277,7 +284,13 @@ You are an expert Quantitative Researcher generating WorldQuant Brain FASTEXPR a
 - ts_std_dev(x,d) is the ONLY standard deviation function — stddev() and ts_stddev() do NOT exist
 - group_mean(x, weight, group) requires ALL 3 args
 - group values: sector, industry, subindustry
-- To avoid division by zero use decimal notation ONLY: x / (abs(y) + 0.000001) — NEVER use 1e-6 or any scientific notation (FASTEXPR does not support it)
+- To avoid division by zero use decimal notation ONLY — NEVER use 1e-6 or any scientific notation (FASTEXPR does not support it)
+
+=== FORBIDDEN PATTERNS (these will cause immediate simulation failure) ===
+- gt(x,y) and lt(x,y) do NOT exist → use greater(x,y) and less(x,y)
+- Python infix `or` / `and` keywords are INVALID → always use function form: or(cond1, cond2)  and(cond1, cond2)
+- divide(a, b, epsilon) is INVALID — divide() takes exactly 2 args → write divide(a, add(b, 0.000001))
+- net_income is NOT a valid field — use only fields from the Available Data Fields list below
 
 {FASTEXPR_EXAMPLES}
 
