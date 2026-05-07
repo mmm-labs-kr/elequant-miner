@@ -217,10 +217,10 @@ class GeminiEngine:
         code = re.sub(r'\bts_stddev\(', 'ts_std_dev(', code)
         code = re.sub(r'\bstddev\(', 'ts_std_dev(', code)
         code = re.sub(r'\bstdev\(', 'ts_std_dev(', code)
-        code = re.sub(r'mul\(([^,]+),\s*([^)]+)\)', r'(\1 * \2)', code)
-        code = re.sub(r'div\(([^,]+),\s*([^)]+)\)', r'(\1 / \2)', code)
-        code = re.sub(r'add\(([^,]+),\s*([^)]+)\)', r'(\1 + \2)', code)
-        code = re.sub(r'sub\(([^,]+),\s*([^)]+)\)', r'(\1 - \2)', code)
+        # Short aliases → canonical FASTEXPR names
+        code = re.sub(r'\bmul\(', 'multiply(', code)
+        code = re.sub(r'\bdiv\(', 'divide(', code)
+        code = re.sub(r'\bsub\(', 'subtract(', code)
         # rank/zscore/scale/normalize accept only 1 mandatory arg;
         # strip trailing float literal (e.g. rank(x, 0.001) → rank(x))
         code = re.sub(r'\b(rank|zscore|scale|normalize)\(([^,)]+),\s*\d*\.\d+\)', r'\1(\2)', code)
@@ -237,7 +237,90 @@ class GeminiEngine:
             lambda m: format(float(m.group(0)), 'f').rstrip('0').rstrip('.') or '0',
             code
         )
+        code = GeminiEngine._fix_arithmetic_patterns(code)
         return code
+
+    @staticmethod
+    def _split_top_args(s: str) -> list[str]:
+        """Split s by top-level commas (not inside parentheses)."""
+        args, depth, buf = [], 0, []
+        for ch in s:
+            if ch == '(':
+                depth += 1
+                buf.append(ch)
+            elif ch == ')':
+                depth -= 1
+                buf.append(ch)
+            elif ch == ',' and depth == 0:
+                args.append(''.join(buf).strip())
+                buf = []
+            else:
+                buf.append(ch)
+        if buf:
+            args.append(''.join(buf).strip())
+        return args
+
+    @staticmethod
+    def _fix_arithmetic_patterns(code: str) -> str:
+        """Fix infix arithmetic and epsilon-tuple patterns the LLM generates."""
+        # Simple (word OP word) infix not after a function name → functional form
+        code = re.sub(r'(?<![a-zA-Z_\d])\((\w+)\s*\+\s*(\w+)\)', r'add(\1, \2)', code)
+        code = re.sub(r'(?<![a-zA-Z_\d])\((\w+)\s*-\s*(\w+)\)', r'subtract(\1, \2)', code)
+        code = re.sub(r'(?<![a-zA-Z_\d])\((\w+)\s*\*\s*(\w+)\)', r'multiply(\1, \2)', code)
+        code = re.sub(r'(?<![a-zA-Z_\d])\((\w+)\s*/\s*(\w+)\)', r'divide(\1, \2)', code)
+
+        _FLOAT_RE = re.compile(r'^-?[\d.]+$')
+        result = []
+        i = 0
+        n = len(code)
+        while i < n:
+            matched = False
+            # Fix 3-arg divide(A, B, eps)/subtract(A, B, eps) where eps is a float literal
+            for fn in ('divide', 'subtract'):
+                end = i + len(fn) + 1
+                if code[i:end] == fn + '(' and (i == 0 or not (code[i-1].isalnum() or code[i-1] == '_')):
+                    j = i + len(fn) + 1
+                    depth = 1
+                    while j < n and depth > 0:
+                        if code[j] == '(':
+                            depth += 1
+                        elif code[j] == ')':
+                            depth -= 1
+                        j += 1
+                    inner = code[i + len(fn) + 1: j - 1]
+                    args = GeminiEngine._split_top_args(inner)
+                    if len(args) == 3 and _FLOAT_RE.match(args[2].strip()):
+                        eps = args[2].strip()
+                        if fn == 'divide':
+                            # divide(A, B, eps) → divide(A, add(B, eps))
+                            result.append(f"divide({args[0]}, add({args[1]}, {eps}))")
+                        else:
+                            # subtract(A, B, eps) → subtract(A, B) — drop stray epsilon
+                            result.append(f"subtract({args[0]}, {args[1]})")
+                        i = j
+                        matched = True
+                        break
+            if matched:
+                continue
+            # Fix (expr, float_literal) tuple not after a function name → add(expr, float)
+            if code[i] == '(' and (i == 0 or not (code[i-1].isalnum() or code[i-1] == '_')):
+                j = i + 1
+                depth = 1
+                while j < n and depth > 0:
+                    if code[j] == '(':
+                        depth += 1
+                    elif code[j] == ')':
+                        depth -= 1
+                    j += 1
+                inner = code[i + 1: j - 1]
+                args = GeminiEngine._split_top_args(inner)
+                if len(args) == 2 and _FLOAT_RE.match(args[1].strip()):
+                    result.append(f"add({args[0]}, {args[1].strip()})")
+                    i = j
+                    continue
+            result.append(code[i])
+            i += 1
+        return ''.join(result)
 
     _VALID_UNIVERSES = {"TOP3000", "TOP2000", "TOP1000", "TOP500", "TOP200", "TOPSP500"}
     _VALID_NEUTRALIZATIONS = {"NONE", "MARKET", "SECTOR", "INDUSTRY", "SUBINDUSTRY"}
