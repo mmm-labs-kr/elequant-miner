@@ -11,7 +11,7 @@ from rich.table import Table
 from rich import box
 
 from core.db_manager import DBManager
-from core.ai_engine import GeminiEngine
+from core.ai_engine import GeminiEngine, DailyQuotaExhausted
 from core.api_client import WQClient
 from utils.dedup_manager import DedupManager
 from utils.paths import DB_PATH, ENV_FILE, LOGS_DIR, DATA_DIR
@@ -222,6 +222,17 @@ class ElequantMiner:
                 else:
                     time.sleep(15)
 
+        except DailyQuotaExhausted as e:
+            console.print(Panel(
+                f"[bold red]{e}[/]\n\n"
+                f"[bold]이번 세션:[/] "
+                f"시도 {session_stats['tried']} | "
+                f"[green]합격 {session_stats['passed']}[/] | "
+                f"[red]실패 {session_stats['failed']}[/]\n"
+                "[dim]내일 자정 이후 재시작하세요.[/]",
+                title="[bold red]📵 일일 할당량 소진 — 종료[/]",
+                border_style="red",
+            ))
         except KeyboardInterrupt:
             console.print(Panel(
                 f"[bold]진행 중인 시뮬레이션:[/] {len(slots)}개 — WQ 서버에서 계속 실행 중\n"

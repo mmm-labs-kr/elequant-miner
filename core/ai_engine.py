@@ -8,6 +8,10 @@ from google import genai
 from utils.paths import ENV_FILE, OPERATORS_JSON, DATAFIELDS_JSON, DATA_DIR
 
 
+class DailyQuotaExhausted(Exception):
+    """Raised when a model's daily request quota is fully consumed."""
+
+
 GEN_MODEL = "gemini-2.5-flash"
 FIX_MODEL = "gemini-2.5-flash-lite"
 
@@ -79,11 +83,10 @@ class _ModelQuota:
         self._reset_daily_if_needed()
 
         if self._daily_count >= self.max_rpd:
-            tomorrow = datetime.combine(date.today() + timedelta(days=1), datetime.min.time())
-            wait_sec = (tomorrow - datetime.now()).total_seconds() + 60
-            logging.warning(f"Daily quota exhausted. Sleeping {wait_sec/3600:.1f}h until tomorrow...")
-            time.sleep(wait_sec)
-            self._reset_daily_if_needed()
+            raise DailyQuotaExhausted(
+                f"Daily quota exhausted ({self._daily_count}/{self.max_rpd} requests used). "
+                "Restart tomorrow or increase quota limits."
+            )
 
         elapsed = (datetime.now() - self._last_call).total_seconds()
         if elapsed < self.min_interval:
