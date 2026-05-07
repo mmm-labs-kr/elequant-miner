@@ -214,6 +214,8 @@ class GeminiEngine:
         code = re.sub(r'\blt\(', 'less(', code)
         code = re.sub(r'\bge\(', 'greater_equal(', code)
         code = re.sub(r'\ble\(', 'less_equal(', code)
+        # negative(x) does not exist — replace with multiply(-1, x)
+        code = re.sub(r'\bnegative\(', 'multiply(-1, ', code)
         # FASTEXPR does not support scientific notation — convert to decimal
         code = re.sub(
             r'\d+(?:\.\d+)?[eE][+-]?\d+',
@@ -301,8 +303,12 @@ You are an expert Quantitative Researcher generating WorldQuant Brain FASTEXPR a
 
 === FORBIDDEN PATTERNS (these will cause immediate simulation failure) ===
 - gt(x,y) and lt(x,y) do NOT exist → use greater(x,y) and less(x,y)
+- negative(x) does NOT exist → use multiply(-1, x)
 - Python infix `or` / `and` keywords are INVALID → always use function form: or(cond1, cond2)  and(cond1, cond2)
-- divide(a, b, epsilon) is INVALID — divide() takes exactly 2 args → write divide(a, add(b, 0.000001))
+- divide() and subtract() take exactly 2 args — NEVER pass epsilon as a 3rd arg
+  Wrong: subtract(multiply(2,close), high, low)  →  Right: subtract(subtract(multiply(2,close), high), low)
+  Wrong: divide(a, b, 0.000001)  →  Right: divide(a, add(b, 0.000001))
+- (high + low) infix inside function args is unreliable → use add(high, low) instead
 - net_income is NOT a valid field — use only fields from the Available Data Fields list below
 
 {FASTEXPR_EXAMPLES}
