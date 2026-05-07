@@ -88,8 +88,21 @@ class _ModelQuota:
 
 class GeminiEngine:
     def __init__(self):
-        self.api_key = os.getenv("GEMINI_API_KEY")
-        self.client = genai.Client(api_key=self.api_key)
+        backend = os.getenv("GEMINI_BACKEND", "aistudio").lower()
+
+        if backend == "vertex":
+            project  = os.getenv("GOOGLE_CLOUD_PROJECT")
+            location = os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")
+            if not project:
+                raise ValueError("Vertex AI 사용 시 GOOGLE_CLOUD_PROJECT를 .env에 설정하세요.")
+            self.client = genai.Client(vertexai=True, project=project, location=location)
+            logging.info(f"Gemini backend: Vertex AI (project={project}, location={location})")
+        else:
+            api_key = os.getenv("GEMINI_API_KEY")
+            if not api_key:
+                raise ValueError("AI Studio 사용 시 GEMINI_API_KEY를 .env에 설정하세요.")
+            self.client = genai.Client(api_key=api_key)
+            logging.info("Gemini backend: AI Studio")
 
         self._gen_quota = _ModelQuota(GEN_RPM, GEN_RPD, min_interval=15)
         self._fix_quota = _ModelQuota(FIX_RPM, FIX_RPD, min_interval=3)
