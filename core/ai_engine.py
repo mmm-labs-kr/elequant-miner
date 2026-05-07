@@ -34,8 +34,11 @@ Correct FASTEXPR examples — study the argument counts carefully:
 6. Combined:         rank(ts_mean(returns, 20)) - rank(ts_std_dev(returns, 20))
 7. Conditional:      if_else(or(greater(returns, 0), less(ts_mean(volume,5), 1000)), rank(close), -rank(close))
 8. Safe divide:      divide(close, add(high, add(low, 0.000001)))
-9. Accruals anomaly: rank(subtract(ts_mean(mdf_coa, 4), ts_mean(mdf_roa, 4)))
-10. Vol skew signal: rank(subtract(ts_mean(opt6_pvolu, 5), ts_mean(opt6_cvolu, 5)))
+9.  Accruals anomaly: rank(subtract(ts_mean(mdf_coa, 4), ts_mean(mdf_roa, 4)))
+10. Vol skew signal:  rank(subtract(ts_mean(opt6_pvolu, 5), ts_mean(opt6_cvolu, 5)))
+11. Price channel (Williams %R style):
+    divide(subtract(subtract(multiply(2, close), high), low), add(subtract(high, low), 0.000001))
+    ← denominator is add(expr, epsilon), NOT (expr, epsilon) or divide(a, b, epsilon)
 """
 
 ALPHA_DESIGN_PRINCIPLES = """\
@@ -318,9 +321,11 @@ You are an expert Quantitative Researcher generating WorldQuant Brain FASTEXPR a
 - negative(x) does NOT exist → use multiply(-1, x)
 - Python infix `or` / `and` keywords are INVALID → always use function form: or(cond1, cond2)  and(cond1, cond2)
 - divide() and subtract() take exactly 2 args — NEVER pass epsilon as a 3rd arg
-  Wrong: subtract(multiply(2,close), high, low)  →  Right: subtract(subtract(multiply(2,close), high), low)
-  Wrong: divide(a, b, 0.000001)  →  Right: divide(a, add(b, 0.000001))
+  Wrong: subtract(multiply(2,close), high, low)    Right: subtract(subtract(multiply(2,close), high), low)
+  Wrong: divide(a, b, 0.000001)                    Right: divide(a, add(b, 0.000001))
+  Wrong: divide(a, (b, 0.000001))                  Right: divide(a, add(b, 0.000001))
 - (high + low) infix inside function args is unreliable → use add(high, low) instead
+- group_zscore(x, group): x must be a single expression, group must be sector/industry/subindustry
 - net_income is NOT a valid field — use only fields from the Available Data Fields list below
 
 {FASTEXPR_EXAMPLES}
