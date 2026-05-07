@@ -26,14 +26,26 @@ FIELD_CATEGORIES = [
 
 FASTEXPR_EXAMPLES = """\
 Correct FASTEXPR examples — study the argument counts carefully:
-1. Momentum:       rank(ts_mean(returns, 20))
-2. Mean Reversion: -rank(ts_delta(close, 5))
-3. Volume Surge:   rank(volume / ts_mean(volume, 20))
-4. Sector Neutral: group_zscore(ts_mean(returns, 60), sector)
-5. Reversal:       -ts_rank(close, 20)
-6. Combined:       rank(ts_mean(returns, 20)) - rank(ts_std_dev(returns, 20))
-7. Conditional:    if_else(or(greater(returns, 0), less(ts_mean(volume,5), 1000)), rank(close), -rank(close))
-8. Safe divide:    divide(close, add(high, add(low, 0.000001)))
+1. Momentum:         rank(ts_mean(returns, 20))
+2. Mean Reversion:   -rank(ts_delta(close, 5))
+3. Volume Surge:     rank(volume / ts_mean(volume, 20))
+4. Sector Neutral:   group_zscore(ts_mean(returns, 60), sector)
+5. Reversal:         -ts_rank(close, 20)
+6. Combined:         rank(ts_mean(returns, 20)) - rank(ts_std_dev(returns, 20))
+7. Conditional:      if_else(or(greater(returns, 0), less(ts_mean(volume,5), 1000)), rank(close), -rank(close))
+8. Safe divide:      divide(close, add(high, add(low, 0.000001)))
+9. Accruals anomaly: rank(subtract(ts_mean(mdf_coa, 4), ts_mean(mdf_roa, 4)))
+10. Vol skew signal: rank(subtract(ts_mean(opt6_pvolu, 5), ts_mean(opt6_cvolu, 5)))
+"""
+
+ALPHA_DESIGN_PRINCIPLES = """\
+=== ALPHA DESIGN PRINCIPLES (follow these to avoid overfitting and ensure robustness) ===
+- Economic rationale first: the signal must have a logical reason to predict future returns
+- Simple over complex: a clean 1-line expression beats an over-engineered 5-line formula
+- Always use rank() or zscore() on raw data to handle outliers and ensure uniform distribution
+- Neutralize sector/market bias: wrap with group_zscore(x, subindustry) or group_neutralize when signal may carry sector beta
+- Avoid parameter overloading: minimize use of limit/scale/truncation operators — they hide noise rather than fix it
+- Winsorize extreme values instead of clipping: winsorize(x, std=3) is safer than hard if_else cutoffs
 """
 
 
@@ -312,6 +324,8 @@ You are an expert Quantitative Researcher generating WorldQuant Brain FASTEXPR a
 - net_income is NOT a valid field — use only fields from the Available Data Fields list below
 
 {FASTEXPR_EXAMPLES}
+
+{ALPHA_DESIGN_PRINCIPLES}
 
 {output_section}"""
 

@@ -390,16 +390,42 @@ Return ONLY the evolved raw FASTEXPR expression.
 
         else:
             themes = [
-                "Short-term Mean Reversion using price and volume",
-                "Earnings Quality factor using fundamental data",
-                "Momentum with volatility scaling",
-                "Sector-neutral Value factor",
-                "Liquidity-adjusted Growth factor",
+                # Price/Volume — momentum & reversion
+                "Short-term price reversal: stocks that dropped hardest last week tend to bounce",
+                "Volume-price divergence: price up but volume shrinking signals weakness",
+                "Bollinger Band mean reversion: buy oversold, sell overbought relative to 20d std dev",
+                "MACD-style momentum: fast EMA minus slow EMA as directional signal",
+                "High-low range contraction as volatility breakout precursor",
+                # Fundamental — quality & value
+                "Accruals anomaly (Sloan 1996): firms with low accruals (cash earnings > book earnings) outperform",
+                "Earnings quality: operating cash flow minus net income normalized by assets",
+                "ROA momentum: change in return-on-assets as profitability improvement signal",
+                "Gross margin stability: consistent gross margin over time signals pricing power",
+                "Debt reduction signal: firms paying down debt outperform levered peers",
+                # Options-implied
+                "Implied volatility skew: high put/call IV ratio signals informed bearish positioning",
+                "IV minus realized volatility spread: overpriced options predict reversal",
+                "Option volume surge: unusual call volume relative to open interest as bullish signal",
+                # News sentiment
+                "News sentiment momentum: stocks with improving news sentiment outperform",
+                "Sentiment novelty: high-novelty positive news has stronger price impact than repeated news",
+                "No-news premium: stocks with low news coverage have lower uncertainty, stable returns",
+                # Risk factor orthogonalization
+                "Sector-neutral momentum: rank returns within subindustry to remove sector beta",
+                "Size-adjusted value: P/B ratio neutralized by market cap to isolate pure value signal",
+                "Liquidity-adjusted growth: revenue growth weighted by trading volume stability",
             ]
             theme = random.choice(themes)
             prompt = f"""\
-Create a novel WorldQuant Alpha factor based on: {theme}
-Use 2-3 data fields in combination. Make it non-trivial and statistically motivated.
+Create a WorldQuant Alpha factor based on this research idea:
+{theme}
+
+Guidelines:
+- Base the signal on a clear economic rationale, not data mining
+- Keep the expression simple and elegant (avoid over-engineering)
+- Use rank() or zscore() to handle outliers and ensure robustness
+- Neutralize sector/industry bias with group_zscore or group_neutralize when relevant
+- Use 2-3 data fields maximum
 Return ONLY the raw FASTEXPR expression.
 {fields_context}"""
 
