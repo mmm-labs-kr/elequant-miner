@@ -35,6 +35,20 @@ def compute_status(sharpe, fitness, turnover) -> tuple[str, int]:
     return ("PASSED", 1) if passed else ("REJECTED", 0)
 
 
+def compute_failed_checks(sharpe, fitness, turnover) -> str:
+    """수치로 판단 가능한 4개 체크 기준으로 failed_checks 문자열 생성."""
+    failed = []
+    if sharpe < CRITERIA["sharpe"]:
+        failed.append("LOW_SHARPE")
+    if fitness < CRITERIA["fitness"]:
+        failed.append("LOW_FITNESS")
+    if turnover < CRITERIA["turnover_min"]:
+        failed.append("LOW_TURNOVER")
+    if turnover > CRITERIA["turnover_max"]:
+        failed.append("HIGH_TURNOVER")
+    return ",".join(failed)
+
+
 def compute_quality_score(sharpe, fitness, turnover) -> float:
     if sharpe > 0 and fitness > 0:
         return round((sharpe * fitness) / (1.0 + abs(turnover - 25) / 25.0), 4)
@@ -132,6 +146,7 @@ def main():
 
         status, success_flag = compute_status(sharpe, fitness, turnover)
         quality_score = compute_quality_score(sharpe, fitness, turnover) if success_flag else 0.0
+        failed_checks = compute_failed_checks(sharpe, fitness, turnover) if not success_flag else ""
         created_at = alpha.get("dateCreated", "")[:19].replace("T", " ")
 
         cur = conn.execute(
@@ -143,9 +158,9 @@ def main():
 
         conn.execute(
             """INSERT OR IGNORE INTO metrics
-               (alpha_id, sharpe, turnover, fitness, margin, quality_score, success_flag)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (local_id, sharpe, turnover, fitness, margin, quality_score, success_flag)
+               (alpha_id, sharpe, turnover, fitness, margin, quality_score, failed_checks, success_flag)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (local_id, sharpe, turnover, fitness, margin, quality_score, failed_checks, success_flag)
         )
         conn.execute("INSERT OR IGNORE INTO feedback (alpha_id) VALUES (?)", (local_id,))
 

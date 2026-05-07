@@ -130,6 +130,21 @@ class DBManager:
               AND quality_score IS NULL
         """)
 
+        # REJECTED 행에 failed_checks 백필 (수치로 판단 가능한 4개 체크)
+        cursor.execute("""
+            UPDATE metrics
+            SET failed_checks = RTRIM(
+                CASE WHEN sharpe   <  1.25 THEN 'LOW_SHARPE,'   ELSE '' END ||
+                CASE WHEN fitness  <  1.0  THEN 'LOW_FITNESS,'  ELSE '' END ||
+                CASE WHEN turnover <  1.0  THEN 'LOW_TURNOVER,' ELSE '' END ||
+                CASE WHEN turnover > 70.0  THEN 'HIGH_TURNOVER,' ELSE '' END,
+                ','
+            )
+            WHERE success_flag = 0
+              AND (failed_checks IS NULL OR failed_checks = '')
+              AND sharpe IS NOT NULL AND fitness IS NOT NULL AND turnover IS NOT NULL
+        """)
+
         conn.commit()
         conn.close()
         print(f"Database initialized at {self.db_path}")
