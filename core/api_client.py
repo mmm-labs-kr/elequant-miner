@@ -81,24 +81,39 @@ class WQClient:
             default_settings.update(settings)
 
         payload = {"type": "REGULAR", "settings": default_settings, "regular": alpha_code}
-        response = self.session.post(f"{self.base_url}/simulations", json=payload)
+        for attempt in range(MAX_RETRIES):
+            try:
+                response = self.session.post(f"{self.base_url}/simulations", json=payload)
+            except requests.exceptions.ConnectionError as e:
+                logging.warning(f"simulate connection error (attempt {attempt+1}/{MAX_RETRIES}): {e}")
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(RETRY_DELAY * (attempt + 1))
+                    continue
+                logging.error("simulate failed after all retries due to connection error.")
+                return None
 
-        if response.status_code == 201:
-            sim_url = response.headers.get("Location")
-            logging.info(f"Simulation started: {sim_url}")
-            return sim_url
+            if response.status_code == 201:
+                sim_url = response.headers.get("Location")
+                logging.info(f"Simulation started: {sim_url}")
+                return sim_url
 
-        if self._relogin_if_needed(response):
-            return self.simulate(alpha_code, settings)
+            if self._relogin_if_needed(response):
+                continue
 
-        logging.error(f"Simulation request failed: {response.text}")
+            logging.error(f"Simulation request failed: {response.text}")
+            return None
         return None
 
     def get_alpha_results(self, alpha_id):
         """Fetch final simulation metrics with retry on transient failures."""
         url = f"{self.base_url}/alphas/{alpha_id}"
         for attempt in range(MAX_RETRIES):
-            response = self.session.get(url)
+            try:
+                response = self.session.get(url)
+            except requests.exceptions.ConnectionError as e:
+                logging.warning(f"get_alpha_results connection error (attempt {attempt+1}): {e}")
+                time.sleep(RETRY_DELAY)
+                continue
             if response.status_code == 200:
                 return response.json()
             if self._relogin_if_needed(response):

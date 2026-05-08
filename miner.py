@@ -302,10 +302,15 @@ class ElequantMiner:
         is_fix = bool(error_msg)
 
         if error_msg:
+            event_hint = (
+                "\nHint: 'does not support event inputs' means the field is quarterly/annual event data. "
+                "Wrap it with ts_sum(field, 4) or ts_mean(field, 4) before using in arithmetic."
+                if "event input" in error_msg else ""
+            )
             prompt = f"""\
 FASTEXPR code that caused an error in WorldQuant Brain:
 Code: {parent['code'] if parent else 'N/A'}
-Error: {error_msg}
+Error: {error_msg}{event_hint}
 
 Fix the error. Return ONLY the corrected raw FASTEXPR expression.
 {fields_context}"""
