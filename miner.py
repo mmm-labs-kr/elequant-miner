@@ -45,6 +45,7 @@ class ElequantMiner:
         self.user_directive = None
         self._gen_round = 0  # 0=PASSED발전, 1=near-miss개선, 2=신규탐색
         self._recent_codes: list[str] = []  # 최근 생성 코드 (다양성 유도용)
+        self._exhausted_parents: set[int] = set()  # duplicate 반복 발생한 부모 ID
 
         self.criteria = {
             "sharpe": 1.25,
@@ -118,6 +119,8 @@ class ElequantMiner:
 
                     if self.dedup.is_duplicate(alpha_code):
                         logging.info("[yellow]⚠ Duplicate strategy detected — skipping[/]")
+                        if parent_alpha:
+                            self._exhausted_parents.add(parent_alpha['id'])
                         continue
 
                     self.dedup.add(alpha_code)
@@ -739,6 +742,7 @@ What specific sub-expression changes would most improve the weakest metric?"""
         rows = cursor.fetchall()
         conn.close()
 
+        rows = [r for r in rows if r['id'] not in self._exhausted_parents]
         if not rows:
             return None
 
@@ -793,8 +797,10 @@ What specific sub-expression changes would most improve the weakest metric?"""
 
         if not rows:
             return None
-        # 상위 5개 중 랜덤 선택 (과도한 집중 방지)
-        return random.choice(rows[:5])
+        candidates = [r for r in rows[:5] if r['id'] not in self._exhausted_parents]
+        if not candidates:
+            candidates = rows[:5]  # exhausted 전부면 그냥 다시 허용
+        return random.choice(candidates)
 
     def _get_corr_rejected(self, limit: int = 4) -> list[str]:
         """SELF_CORRELATION 탈락 전략 코드 목록 반환 (B: anti-example용)."""

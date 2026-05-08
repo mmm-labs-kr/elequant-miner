@@ -454,7 +454,10 @@ You are an expert Quantitative Researcher generating WorldQuant Brain FASTEXPR a
                 response = self.client.models.generate_content(
                     model=model,
                     contents=prompt_context,
-                    config={'system_instruction': system_instruction}
+                    config={
+                        'system_instruction': system_instruction,
+                        'temperature': 0.7 if is_fix else 1.5,
+                    }
                 )
                 raw = response.text.strip()
                 self._save_quota_state()
