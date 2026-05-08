@@ -262,6 +262,8 @@ class GeminiEngine:
             lambda m: format(float(m.group(0)), 'f').rstrip('0').rstrip('.') or '0',
             code
         )
+        # Fix zero lookback: ts_func(simple_field, 0) → ts_func(simple_field, 1)
+        code = re.sub(r'\b(ts_\w+)\((\w+),\s*0\)', r'\1(\2, 1)', code)
         code = GeminiEngine._fix_arithmetic_patterns(code)
         return code
 
@@ -414,7 +416,8 @@ You are an expert Quantitative Researcher generating WorldQuant Brain FASTEXPR a
 {self._operator_ref}
 
 === STRICT ARGUMENT RULES ===
-- d (lookback) must be a POSITIVE INTEGER: ts_mean(x, 20) ✓  ts_mean(x, 0.5) ✗
+- d (lookback) must be a POSITIVE INTEGER ≥ 1: ts_mean(x, 20) ✓  ts_mean(x, 0) ✗  ts_mean(x, 0.5) ✗
+  ts_delay(x, 0) is INVALID — use ts_delay(x, 1) or just x for the current value
 - rank(x) takes 1 arg; optional rate must be 0 or 2 (integer): rank(x) ✓  rank(x, 0.001) ✗
 - zscore(x) takes exactly 1 arg: zscore(x) ✓  zscore(x, 0.001) ✗
 - scale(x) takes exactly 1 mandatory arg: scale(x) ✓

@@ -86,8 +86,6 @@ class ElequantMiner:
                 # mode 0: PASSED 발전, mode 1: near-miss 개선, mode 2: 신규 탐색
                 while len(slots) < max_slots:
                     if time.time() < gen_retry_after:
-                        remaining = gen_retry_after - time.time()
-                        logging.info(f"Generation rate-limited — {remaining:.0f}s 후 재시도")
                         break
 
                     mode = self._gen_round % 3
@@ -337,10 +335,15 @@ class ElequantMiner:
                 "Wrap it with ts_sum(field, 4) or ts_mean(field, 4) before using in arithmetic."
                 if "event input" in error_msg else ""
             )
+            lookback_hint = (
+                "\nHint: 'lookback' error means a time-series function has 0 or non-integer period. "
+                "Replace 0 with a positive integer ≥ 1 (e.g. ts_delay(x, 0) → ts_delay(x, 1) or just x)."
+                if "lookback" in error_msg.lower() else ""
+            )
             prompt = f"""\
 FASTEXPR code that caused an error in WorldQuant Brain:
 Code: {parent['code'] if parent else 'N/A'}
-Error: {error_msg}{event_hint}
+Error: {error_msg}{event_hint}{lookback_hint}
 
 Fix the error. Return ONLY the corrected raw FASTEXPR expression.
 {fields_context}"""
