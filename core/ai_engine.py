@@ -132,6 +132,8 @@ class GeminiEngine:
             self.datafields = json.load(f)
 
         self._operator_ref = self._build_operator_reference()
+        self._field_ids = {f['id'] for f in self.datafields}
+        self._operator_names = {op['name'] for op in self.operators}
         self._load_quota_state()
 
     def _build_operator_reference(self) -> str:
@@ -201,6 +203,16 @@ class GeminiEngine:
             or cat.lower() in f['id'].lower()
         ]
         return results[:limit]
+
+    # FASTEXPR 토큰 중 필드명이 아닌 것 (연산자명은 self._operator_names로 별도 관리)
+    _FASTEXPR_NONFIELD = frozenset({'true', 'false'})
+
+    def unknown_fields(self, code: str) -> list[str]:
+        """코드에서 datafields.json에 없는 식별자 토큰을 반환."""
+        tokens = set(re.findall(r'\b[a-zA-Z_][a-zA-Z0-9_]*\b', code))
+        tokens -= self._operator_names
+        tokens -= self._FASTEXPR_NONFIELD
+        return sorted(t for t in tokens if t not in self._field_ids)
 
     @staticmethod
     def _validate(code: str) -> bool:

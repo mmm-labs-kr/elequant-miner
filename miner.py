@@ -457,7 +457,23 @@ Return ONLY the raw FASTEXPR expression.
             f"quota gen={remaining['gemini-2.5-flash']} "
             f"fix={remaining['gemini-2.5-flash-lite']}"
         )
-        return self.ai.generate_alpha(prompt, is_fix=is_fix)  # (code, settings) | None
+        result = self.ai.generate_alpha(prompt, is_fix=is_fix)  # (code, settings) | None
+        if result:
+            code, settings = result
+            unknown = self.ai.unknown_fields(code)
+            if unknown:
+                logging.warning(f"Unknown fields detected {unknown} — auto-fixing...")
+                fix_prompt = (
+                    f"FASTEXPR code uses unknown field names that do not exist in WQ Brain: {', '.join(unknown)}\n"
+                    f"Code: {code}\n"
+                    f"Replace each unknown field with the most semantically similar valid field "
+                    f"from the list below. Return ONLY the corrected raw FASTEXPR expression.\n"
+                    f"{fields_context}"
+                )
+                fixed = self.ai.generate_alpha(fix_prompt, is_fix=True)
+                if fixed:
+                    return fixed
+        return result
 
     def _save_alpha(self, code, parent_id):
         conn = sqlite3.connect(self.db.db_path)
