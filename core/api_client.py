@@ -143,6 +143,19 @@ class WQClient:
             offset += limit
         return results
 
+    def poll_simulation(self, sim_url: str):
+        """Poll simulation status URL with retry on connection errors.
+        Returns Response object or None if all retries fail."""
+        for attempt in range(MAX_RETRIES):
+            try:
+                return self.session.get(sim_url)
+            except requests.exceptions.ConnectionError as e:
+                logging.warning(f"poll_simulation connection error (attempt {attempt+1}/{MAX_RETRIES}): {e}")
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(RETRY_DELAY)
+        logging.error(f"poll_simulation failed after {MAX_RETRIES} attempts: {sim_url}")
+        return None
+
     def get_detailed_stats(self, alpha_id):
         """Fetch per-year breakdown with retry on transient failures."""
         url = f"{self.base_url}/alphas/{alpha_id}/check"

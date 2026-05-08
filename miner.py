@@ -77,7 +77,7 @@ class ElequantMiner:
 
         slots = self._resume_pending()
         max_slots = 3
-        session_stats = {"tried": 0, "passed": 0, "failed": 0}
+        session_stats = {"tried": len(slots), "passed": 0, "failed": 0}
         gen_retry_after = 0.0  # rate limit backoff 타이머
 
         try:
@@ -152,9 +152,12 @@ class ElequantMiner:
                 # 슬롯 상태 체크
                 for slot in slots[:]:
                     try:
-                        response = self.wq.session.get(slot['sim_url'])
+                        response = self.wq.poll_simulation(slot['sim_url'])
+                        if response is None:
+                            continue  # 네트워크 오류 — 다음 폴링 사이클에 재시도
                         if response.status_code != 200:
                             logging.error(f"Slot HTTP {response.status_code}: {slot['sim_url']}")
+                            self._update_alpha_status(slot['alpha_id'], 'TIMEOUT')
                             slots.remove(slot)
                             continue
 
