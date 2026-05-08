@@ -132,6 +132,7 @@ class GeminiEngine:
             self.datafields = json.load(f)
 
         self._operator_ref = self._build_operator_reference()
+        self._field_ref = self._build_field_reference()
         self._field_ids = {f['id'] for f in self.datafields}
         self._operator_names = {op['name'] for op in self.operators}
         self._load_quota_state()
@@ -143,6 +144,15 @@ class GeminiEngine:
         lines = []
         for cat, defs in by_cat.items():
             lines.append(f"[{cat}] " + "  ".join(defs))
+        return "\n".join(lines)
+
+    def _build_field_reference(self) -> str:
+        by_cat: dict[str, list[str]] = {}
+        for f in self.datafields:
+            by_cat.setdefault(f.get('category', 'Other'), []).append(f['id'])
+        lines = []
+        for cat, ids in sorted(by_cat.items()):
+            lines.append(f"[{cat}]\n" + ", ".join(ids))
         return "\n".join(lines)
 
     # ------------------------------------------------------------------ quota persistence
@@ -424,7 +434,10 @@ You are an expert Quantitative Researcher generating WorldQuant Brain FASTEXPR a
   Wrong: divide(a, (b, 0.000001))                  Right: divide(a, add(b, 0.000001))
 - (high + low) infix inside function args is unreliable → use add(high, low) instead
 - group_zscore(x, group): x must be a single expression, group must be sector/industry/subindustry
-- net_income is NOT a valid field — use only fields from the Available Data Fields list below
+- ONLY use field IDs from the complete list below — any other identifier is invalid
+
+=== COMPLETE VALID DATA FIELDS (use ONLY these IDs — no other field names exist) ===
+{self._field_ref}
 
 {FASTEXPR_EXAMPLES}
 
