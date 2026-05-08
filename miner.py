@@ -44,6 +44,7 @@ class ElequantMiner:
         self.password = password
         self.user_directive = None
         self._gen_round = 0  # 0=PASSED발전, 1=near-miss개선, 2=신규탐색
+        self._recent_codes: list[str] = []  # 최근 생성 코드 (다양성 유도용)
 
         self.criteria = {
             "sharpe": 1.25,
@@ -299,6 +300,29 @@ class ElequantMiner:
             [f"- {f['id']}: {f['description']}" for f in selected_fields]
         )
 
+        # A: 최근 생성 패턴 요약 (explore/evolve에서 반복 방지)
+        diversity_hint = ""
+        if self._recent_codes and not error_msg and not is_nearmiss:
+            recent_sample = self._recent_codes[-5:]
+            diversity_hint = (
+                "\n=== DIVERSITY REQUIREMENT ===\n"
+                "These were recently generated — your output must be STRUCTURALLY DIFFERENT "
+                "(use different data fields, different transformation logic, different economic rationale):\n"
+                + "\n".join(f"- {c}" for c in recent_sample)
+            )
+
+        # B: SELF_CORRELATION 탈락 전략 (explore에서 anti-example 제공)
+        corr_hint = ""
+        if not error_msg and not is_nearmiss and not parent:
+            corr_rejected = self._get_corr_rejected(limit=4)
+            if corr_rejected:
+                corr_hint = (
+                    "\n=== AVOID CORRELATION ===\n"
+                    "These alphas had good metrics but were rejected because they are too similar "
+                    "to already-submitted strategies. Generate something with DIFFERENT structure:\n"
+                    + "\n".join(f"- {c}" for c in corr_rejected)
+                )
+
         is_fix = bool(error_msg)
 
         if error_msg:
@@ -402,7 +426,7 @@ Evolve this alpha: change lookback windows, add sector neutralization,
 combine with a complementary signal, or substitute higher-quality data fields.
 {"Focus area: " + self.user_directive if self.user_directive else ""}
 Return ONLY the evolved raw FASTEXPR expression.
-{fields_context}"""
+{fields_context}{diversity_hint}"""
 
         else:
             themes = [
@@ -443,7 +467,7 @@ Guidelines:
 - Neutralize sector/industry bias with group_zscore or group_neutralize when relevant
 - Use 2-3 data fields maximum
 Return ONLY the raw FASTEXPR expression.
-{fields_context}"""
+{fields_context}{diversity_hint}{corr_hint}"""
 
         if is_fix:
             mode = 'fix'
@@ -477,7 +501,10 @@ Return ONLY the raw FASTEXPR expression.
                 )
                 fixed = self.ai.generate_alpha(fix_prompt, is_fix=True)
                 if fixed:
-                    return fixed
+                    result = fixed
+        if result:
+            self._recent_codes.append(result[0])
+            self._recent_codes = self._recent_codes[-15:]  # 최근 15개만 유지
         return result
 
     def _save_alpha(self, code, parent_id):
@@ -751,6 +778,17 @@ What specific sub-expression changes would most improve the weakest metric?"""
             return None
         # 상위 5개 중 랜덤 선택 (과도한 집중 방지)
         return random.choice(rows[:5])
+
+    def _get_corr_rejected(self, limit: int = 4) -> list[str]:
+        """SELF_CORRELATION 탈락 전략 코드 목록 반환 (B: anti-example용)."""
+        conn = sqlite3.connect(self.db.db_path)
+        rows = conn.execute(
+            "SELECT a.code FROM alphas a JOIN metrics m ON a.id = m.alpha_id "
+            "WHERE a.status = 'REJECTED_BY_CORR' ORDER BY m.sharpe DESC LIMIT ?",
+            (limit,)
+        ).fetchall()
+        conn.close()
+        return [r[0] for r in rows]
 
 
 if __name__ == "__main__":
