@@ -351,14 +351,25 @@ Fix the error. Return ONLY the corrected raw FASTEXPR expression.
             # 실패한 각 체크에 대해 수치 gap + 구체적 개선 안내 생성
             fail_lines = []
             if 'LOW_SHARPE' in failed_set and isinstance(sharpe, (int, float)):
+                gap = 1.25 - sharpe
+                severity = "far from target — consider a fundamentally different signal" if gap > 0.5 else "close — minor structural fix may suffice"
                 fail_lines.append(
-                    f"- LOW_SHARPE: {sharpe:.3f} → need ≥1.25 (gap {1.25-sharpe:.3f})\n"
-                    f"  Fix: wrap with group_zscore(..., subindustry), add complementary signal, or use ts_zscore for consistency"
+                    f"- LOW_SHARPE: {sharpe:.3f} → need ≥1.25 (gap {gap:.3f}, {severity})\n"
+                    f"  Fix: \n"
+                    f"  1. group_zscore(signal, subindustry) removes sector/size noise that dilutes Sharpe\n"
+                    f"  2. Combine with an orthogonal signal: e.g., add ts_zscore(volume_signal, 20) to price signal\n"
+                    f"  3. Use ts_zscore(x, 60) on the raw signal before ranking to filter noise\n"
+                    f"  4. If sharpe < 0.5, the signal direction may be wrong — try multiply(-1, signal)"
                 )
             if 'LOW_FITNESS' in failed_set and isinstance(fitness, (int, float)):
+                gap = 1.0 - fitness
                 fail_lines.append(
-                    f"- LOW_FITNESS: {fitness:.3f} → need ≥1.0 (gap {1.0-fitness:.3f})\n"
-                    f"  Fix: add rank()/ts_zscore() to stabilize signal year-over-year, reduce lookback variance, or use ts_decay_linear"
+                    f"- LOW_FITNESS: {fitness:.3f} → need ≥1.0 (gap {gap:.3f})\n"
+                    f"  Fix (Fitness = consistency across years):\n"
+                    f"  1. ts_decay_linear(signal, 5) smooths signal to reduce year-to-year variance\n"
+                    f"  2. Use longer lookback (20→60) to capture more stable patterns\n"
+                    f"  3. group_zscore neutralization helps fitness by removing macro regime effects\n"
+                    f"  4. Avoid signals sensitive to a single year — check if lookback spans multiple regimes"
                 )
             if 'LOW_TURNOVER' in failed_set and isinstance(turnover, (int, float)):
                 fail_lines.append(
@@ -372,9 +383,15 @@ Fix the error. Return ONLY the corrected raw FASTEXPR expression.
                 )
             if 'LOW_SUB_UNIVERSE_SHARPE' in failed_set:
                 fail_lines.append(
-                    f"- LOW_SUB_UNIVERSE_SHARPE: signal breaks down on smaller stock subsets\n"
-                    f"  Fix: add group_zscore(..., subindustry) or group_neutralize to reduce sector bias; "
-                    f"try universe=TOP1000 for tighter coverage; avoid signals that only work on large-caps"
+                    f"- LOW_SUB_UNIVERSE_SHARPE: Sharpe={sharpe:.3f} overall but signal collapses on smaller-cap subsets\n"
+                    f"  Root cause: signal relies on large-cap price/volume patterns that don't generalize\n"
+                    f"  Fix (try in order):\n"
+                    f"  1. Wrap the ENTIRE expression with group_zscore(..., subindustry) — forces signal to compete only within same industry group, making it work across all market caps\n"
+                    f"  2. Add ts_zscore(signal, d) normalization BEFORE group_zscore — removes absolute-level dependency\n"
+                    f"  3. Replace any ts_mean/ts_delta on price/close with rank()-based equivalent (rank is cap-size agnostic)\n"
+                    f"  4. Use winsorize(signal, std=3) to suppress small-cap outliers that distort the signal\n"
+                    f"  5. If using fundamental data, normalize by total_assets or market_cap to make it size-neutral\n"
+                    f"  DO NOT just change universe — fix the signal structure to work across all sizes"
                 )
             if 'CONCENTRATED_WEIGHT' in failed_set:
                 fail_lines.append(
