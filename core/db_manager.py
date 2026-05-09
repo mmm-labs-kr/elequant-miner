@@ -117,6 +117,11 @@ class DBManager:
             except sqlite3.OperationalError:
                 pass
 
+        try:
+            cursor.execute("ALTER TABLE feedback ADD COLUMN sweep_summary TEXT")
+        except sqlite3.OperationalError:
+            pass
+
         # 기존 PASSED_A/B/C → PASSED 정규화
         cursor.execute(
             "UPDATE alphas SET status = 'PASSED' WHERE status IN ('PASSED_A', 'PASSED_B', 'PASSED_C')"

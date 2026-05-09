@@ -435,7 +435,8 @@ Fix the error. Return ONLY the corrected raw FASTEXPR expression.
             turnover = parent['turnover'] if 'turnover' in keys else 0
             failed_str = parent['failed_checks'] if 'failed_checks' in keys else ""
             failed_set = set(failed_str.split(',')) if failed_str else set()
-            analysis = parent['llm_analysis']  if 'llm_analysis'  in keys and parent['llm_analysis'] else None
+            analysis      = parent['llm_analysis']  if 'llm_analysis'  in keys and parent['llm_analysis'] else None
+            sweep_summary = parent['sweep_summary'] if 'sweep_summary' in keys and parent['sweep_summary'] else None
 
             # 실패한 각 체크에 대해 수치 gap + 구체적 개선 안내 생성
             fail_lines = []
@@ -498,7 +499,7 @@ Near-miss alpha — passed {7 - len(failed_set)}/7 WQ Brain checks, failing only
 Code: {parent['code']}
 Metrics: Sharpe={sharpe}, Fitness={fitness}, Turnover={turnover}%
 {f'Previous LLM analysis: {analysis}' if analysis else ''}
-
+{sweep_summary if sweep_summary else ''}
 === FAILING CHECKS — fix ONLY these, leave passing parts untouched ===
 {fail_text}
 
@@ -862,7 +863,7 @@ What specific sub-expression changes would most improve the weakest metric?"""
         cursor = conn.cursor()
         cursor.execute("""
             SELECT a.id, a.code, m.sharpe, m.fitness, m.turnover,
-                   m.failed_checks, f.llm_analysis,
+                   m.failed_checks, f.llm_analysis, f.sweep_summary,
                    CASE
                      WHEN m.failed_checks IS NULL THEN 0
                      ELSE (LENGTH(m.failed_checks) - LENGTH(REPLACE(m.failed_checks, ',', ''))) + 1
@@ -1120,12 +1121,38 @@ What specific sub-expression changes would most improve the weakest metric?"""
             logging.info(f"🔍 Sweep early stop: universe (worsened)")
 
     def _finish_sweep(self):
-        """스윕 완료: sweep_done=1 마킹 후 상태 초기화."""
+        """스윕 완료: sweep_done=1 마킹, 결과 요약 저장 후 상태 초기화."""
         if self._sweep is None:
             return
-        parent_id = self._sweep['parent_id']
+        sw = self._sweep
+        parent_id = sw['parent_id']
+
+        # 결과 요약 생성
+        lines = [
+            "=== Sweep Results (parameter tuning already exhausted) ===",
+            f"Base Sharpe: {sw['base_sharpe']:.3f}",
+        ]
+        if sw['best_by_phase']:
+            best_overall = sw['best_overall']
+            best_str = ", ".join(f"{k}={v}" for k, v in best_overall['settings'].items())
+            lines.append(f"Best found: {best_str} → Sharpe={best_overall['sharpe']:.3f}")
+            for phase, result in sw['best_by_phase'].items():
+                gain = result['sharpe'] - sw['base_sharpe']
+                lines.append(f"  {result['param']}={result['val']}: Sharpe={result['sharpe']:.3f} ({gain:+.3f})")
+        else:
+            lines.append("No parameter improved Sharpe.")
+        lines.append("→ Parameter tuning is exhausted. Fix the CODE STRUCTURE, not the settings.")
+        summary = "\n".join(lines)
+
         conn = sqlite3.connect(self.db.db_path)
         conn.execute("UPDATE alphas SET sweep_done = 1 WHERE id = ?", (parent_id,))
+        conn.execute(
+            "INSERT OR IGNORE INTO feedback (alpha_id) VALUES (?)", (parent_id,)
+        )
+        conn.execute(
+            "UPDATE feedback SET sweep_summary = ? WHERE alpha_id = ?",
+            (summary, parent_id)
+        )
         conn.commit()
         conn.close()
         logging.info(f"🔍 Sweep complete for Alpha #{parent_id}")
