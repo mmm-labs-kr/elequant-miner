@@ -437,8 +437,10 @@ You are an expert Quantitative Researcher generating WorldQuant Brain FASTEXPR a
   Wrong: divide(a, (b, 0.000001))                  Right: divide(a, add(b, 0.000001))
 - (high + low) infix inside function args is unreliable → use add(high, low) instead
 - group_zscore(x, group): x must be a single expression, group must be sector/industry/subindustry
-- Event-type fields (fnd6_*, fn_*, adv*_a quarterly/annual fields) cannot be used directly
-  in arithmetic operators — wrap them first: ts_sum(fnd6_sales, 4) or ts_mean(fn_eps_a, 4)
+- Event-type fields (fnd6_*, fn_*, adv*_a quarterly/annual fields) CANNOT be used with ANY
+  operator including ts_mean, ts_sum, ts_rank, divide, multiply, add — all fail with "event inputs" error
+  ONLY valid uses: rank(fnd6_field) or zscore(fnd6_field) directly, with no ts_ wrapper
+  If you need a fundamental ratio, use non-event fields (e.g. replace fnd6_oibdps with mdf_oibdps or ebitda)
 - ONLY use field IDs from the complete list below — any other identifier is invalid
 
 === COMPLETE VALID DATA FIELDS (use ONLY these IDs — no other field names exist) ===

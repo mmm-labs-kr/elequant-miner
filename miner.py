@@ -344,7 +344,9 @@ class ElequantMiner:
         if error_msg:
             event_hint = (
                 "\nHint: 'does not support event inputs' means the field is quarterly/annual event data. "
-                "Wrap it with ts_sum(field, 4) or ts_mean(field, 4) before using in arithmetic."
+                "ts_mean/ts_sum/ts_rank/divide ALL fail on event fields. "
+                "Fix: replace the event field (fnd6_*, fn_*) with a non-event equivalent, "
+                "OR use rank(field) or zscore(field) directly without any ts_ wrapper."
                 if "event input" in error_msg else ""
             )
             lookback_hint = (
