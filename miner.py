@@ -408,13 +408,20 @@ class ElequantMiner:
         is_fix = bool(error_msg)
 
         if error_msg:
-            event_hint = (
-                "\nHint: 'does not support event inputs' means the field is quarterly/annual event data. "
-                "ts_mean/ts_sum/ts_rank/divide ALL fail on event fields. "
-                "Fix: replace the event field (fnd6_*, fn_*) with a non-event equivalent, "
-                "OR use rank(field) or zscore(field) directly without any ts_ wrapper."
-                if "event input" in error_msg else ""
-            )
+            if "event input" in error_msg:
+                import re as _re
+                _field = (_re.search(r'fnd\d+_\w+|fn_\w+|nws\d+_\w+', parent['code'] if parent else '') or None)
+                _fname = _field.group(0) if _field else "the event field"
+                event_hint = (
+                    f"\nCRITICAL — event field error: '{_fname}' is quarterly/annual event data. "
+                    f"ALL of these FAIL on event fields: ts_mean, ts_sum, ts_rank, ts_zscore, ts_std_dev, divide, multiply. "
+                    f"You MUST do ONE of the following — no exceptions:\n"
+                    f"  (A) Replace '{_fname}' entirely with a daily field (close, volume, returns, adv20, etc.)\n"
+                    f"  (B) Use ONLY rank({_fname}) or zscore({_fname}) with NOTHING else wrapping it.\n"
+                    f"Do NOT put ANY operator around {_fname} except rank() or zscore()."
+                )
+            else:
+                event_hint = ""
             lookback_hint = (
                 "\nHint: 'lookback' error means a time-series function has 0 or non-integer period. "
                 "Replace 0 with a positive integer ≥ 1 (e.g. ts_delay(x, 0) → ts_delay(x, 1) or just x)."
