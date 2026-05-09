@@ -176,17 +176,21 @@ class ElequantMiner:
                             results = self.wq.get_alpha_results(alpha_wq_id)
                             detailed = self.wq.get_detailed_stats(alpha_wq_id)
 
-                            if results:
-                                results['detailed'] = detailed
-                                results['_code'] = slot['code']
-                                passed = self._process_results(slot['alpha_id'], results)
+                            passed = False
+                            try:
+                                if results:
+                                    results['detailed'] = detailed
+                                    results['_code'] = slot['code']
+                                    passed = self._process_results(slot['alpha_id'], results)
+                            except Exception as proc_err:
+                                logging.error(f"Result processing error #{slot['alpha_id']}: {proc_err}")
+                            finally:
                                 if passed:
                                     session_stats["passed"] += 1
                                 else:
                                     session_stats["failed"] += 1
-
-                            slots.remove(slot)
-                            self._print_session_stats(session_stats)
+                                slots.remove(slot)
+                                self._print_session_stats(session_stats)
 
                         elif status in ["FAILED", "ERROR"]:
                             error_msg = data.get("message", "Unknown error")
@@ -583,11 +587,11 @@ Return ONLY the raw FASTEXPR expression.
             self._update_alpha_status(alpha_id, f"FAILED: {error_msg[:50]}")
             return False
 
-        is_stats = results.get('is', {})
-        sharpe   = is_stats.get('sharpe', 0)
-        fitness  = is_stats.get('fitness', 0)
+        is_stats = results.get('is') or {}
+        sharpe   = is_stats.get('sharpe') or 0
+        fitness  = is_stats.get('fitness') or 0
         turnover = (is_stats.get('turnover') or 0) * 100  # API: 소수 → %
-        margin   = is_stats.get('margin', 0) or 0
+        margin   = is_stats.get('margin') or 0
         returns  = is_stats.get('returns') or is_stats.get('annualizedReturns')
 
         # WQ Brain /check 결과를 직접 사용 (7개 기준 전부 반영)
@@ -637,23 +641,25 @@ Return ONLY the raw FASTEXPR expression.
             status = "REJECTED"
 
         conn = sqlite3.connect(self.db.db_path)
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO metrics "
-            "(alpha_id, sharpe, turnover, fitness, margin, returns, sub_sharpe, max_corr, "
-            " quality_score, failed_checks, success_flag) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (alpha_id, sharpe, turnover, fitness, margin,
-             returns, sub_sharpe, max_corr,
-             quality_score,
-             ",".join(failed_keys) if failed_keys else None,
-             1 if success else 0)
-        )
-        cursor.execute("UPDATE alphas SET status = ? WHERE id = ?", (status, alpha_id))
-        cursor.execute("INSERT OR IGNORE INTO feedback (alpha_id) VALUES (?)", (alpha_id,))
-        self._store_yearly_metrics(alpha_id, detailed, cursor)
-        conn.commit()
-        conn.close()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT OR REPLACE INTO metrics "
+                "(alpha_id, sharpe, turnover, fitness, margin, returns, sub_sharpe, max_corr, "
+                " quality_score, failed_checks, success_flag) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (alpha_id, sharpe, turnover, fitness, margin,
+                 returns, sub_sharpe, max_corr,
+                 quality_score,
+                 ",".join(failed_keys) if failed_keys else None,
+                 1 if success else 0)
+            )
+            cursor.execute("UPDATE alphas SET status = ? WHERE id = ?", (status, alpha_id))
+            cursor.execute("INSERT OR IGNORE INTO feedback (alpha_id) VALUES (?)", (alpha_id,))
+            self._store_yearly_metrics(alpha_id, detailed, cursor)
+            conn.commit()
+        finally:
+            conn.close()
 
         metrics_line = (
             f"Sharpe=[bold]{sharpe:.3f}[/]  "
