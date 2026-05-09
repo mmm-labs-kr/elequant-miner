@@ -16,6 +16,7 @@ from core.ai_engine import GeminiEngine, DailyQuotaExhausted
 from core.api_client import WQClient
 from utils.dedup_manager import DedupManager
 from utils.paths import DB_PATH, ENV_FILE, LOGS_DIR, DATA_DIR
+from utils.yearly_context import build_yearly_context, get_alpha_yearly_summary
 
 load_dotenv(ENV_FILE)
 
@@ -397,6 +398,13 @@ class ElequantMiner:
                     + "\n".join(f"- {c}" for c in corr_rejected)
                 )
 
+        # C: 연도별 성과 패턴 (explore/near-miss에서 컨텍스트 제공)
+        yearly_ctx = ""
+        if not error_msg:
+            summary = build_yearly_context(str(self.db.db_path))
+            if summary:
+                yearly_ctx = f"\n=== Historical Context ===\n{summary}"
+
         is_fix = bool(error_msg)
 
         if error_msg:
@@ -496,7 +504,7 @@ Metrics: Sharpe={sharpe}, Fitness={fitness}, Turnover={turnover}%
 
 {"Focus: " + self.user_directive if self.user_directive else ""}
 Return ONLY the corrected raw FASTEXPR expression.
-{fields_context}"""
+{fields_context}{yearly_ctx}"""
 
         elif self.user_directive and not parent:
             prompt = f"""\
@@ -565,7 +573,7 @@ Guidelines:
 - Neutralize sector/industry bias with group_zscore or group_neutralize when relevant
 - Use 2-3 data fields maximum
 Return ONLY the raw FASTEXPR expression.
-{fields_context}{diversity_hint}{corr_hint}"""
+{fields_context}{diversity_hint}{corr_hint}{yearly_ctx}"""
 
         if is_fix:
             mode = 'fix'
