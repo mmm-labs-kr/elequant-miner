@@ -12,7 +12,7 @@ from rich.table import Table
 from rich import box
 
 from core.db_manager import DBManager
-from core.ai_engine import GeminiEngine, DailyQuotaExhausted
+from core.ai_engine import GeminiEngine, DailyQuotaExhausted, ALPHA_SEEDS
 from core.api_client import WQClient
 from utils.dedup_manager import DedupManager
 from utils.paths import DB_PATH, ENV_FILE, LOGS_DIR, DATA_DIR
@@ -581,7 +581,8 @@ Guidelines:
 - Neutralize sector/industry bias with group_zscore or group_neutralize when relevant
 - Use 2-3 data fields maximum
 Return ONLY the raw FASTEXPR expression.
-{fields_context}{diversity_hint}{corr_hint}{yearly_ctx}"""
+{fields_context}{diversity_hint}{corr_hint}{yearly_ctx}
+{ALPHA_SEEDS}"""
 
         if is_fix:
             mode = 'fix'

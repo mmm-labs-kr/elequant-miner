@@ -53,6 +53,22 @@ ALPHA_DESIGN_PRINCIPLES = """\
 - Neutralize sector/market bias: wrap with group_zscore(x, subindustry) or group_neutralize when signal may carry sector beta
 - Avoid parameter overloading: minimize use of limit/scale/truncation operators — they hide noise rather than fix it
 - Winsorize extreme values instead of clipping: winsorize(x, std=3) is safer than hard if_else cutoffs
+- Lookback windows: use ONLY canonical values — 5, 20, 60, 120, 252. Never use arbitrary numbers like 37, 14, 7.
+"""
+
+ALPHA_SEEDS = """\
+=== PROVEN ALPHA STRUCTURES (from WQ Brain official examples — build upon these) ===
+1. Operating Earnings Yield:   ts_rank(operating_income, 252)
+   Settings: decay=0, neutralization=Subindustry
+2. Liabilities appreciation:   -ts_rank(fn_liab_fair_val_l1_a, 252)
+   Settings: decay=0, neutralization=Subindustry
+3. Leverage ratio:             liabilities/assets
+   Settings: decay=0, truncation=0.01, neutralization=Market
+4. Earnings Yield Momentum:    group_rank(ts_rank(est_eps/close, 60), industry)
+   Settings: decay=0, neutralization=Industry
+5. Sentiment instability:      -ts_std_dev(scl12_buzz, 10)
+   Settings: decay=0, neutralization=Industry
+These are starting points — combine, modify, or layer signals to differentiate.
 """
 
 
