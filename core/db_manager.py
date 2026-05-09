@@ -120,6 +120,17 @@ class DBManager:
             "UPDATE alphas SET status = 'PASSED' WHERE status IN ('PASSED_A', 'PASSED_B', 'PASSED_C')"
         )
 
+        # nearmiss_attempts 백필: REJECTED 전략의 자식 수(=이전 near-miss 시도 수)로 초기화
+        cursor.execute("""
+            UPDATE alphas
+            SET nearmiss_attempts = (
+                SELECT COUNT(*) FROM alphas child WHERE child.parent_id = alphas.id
+            )
+            WHERE status = 'REJECTED'
+              AND nearmiss_attempts = 0
+              AND EXISTS (SELECT 1 FROM alphas child WHERE child.parent_id = alphas.id)
+        """)
+
         # 기존 PASSED 행에 quality_score 백필
         cursor.execute("""
             UPDATE metrics

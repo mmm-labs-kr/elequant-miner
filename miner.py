@@ -119,6 +119,14 @@ class ElequantMiner:
                         logging.info("[yellow]⚠ Duplicate strategy detected — skipping[/]")
                         if parent_alpha:
                             self._exhausted_parents.add(parent_alpha['id'])
+                            if is_nearmiss:
+                                conn = sqlite3.connect(self.db.db_path)
+                                conn.execute(
+                                    "UPDATE alphas SET nearmiss_attempts = nearmiss_attempts + 2 WHERE id = ?",
+                                    (parent_alpha['id'],)
+                                )
+                                conn.commit()
+                                conn.close()
                         continue
 
                     self.dedup.add(alpha_code)
