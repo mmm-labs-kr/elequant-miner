@@ -761,12 +761,15 @@ Return ONLY the raw FASTEXPR expression.
     def _store_yearly_metrics(alpha_id: int, detailed: dict, cursor):
         """WQ Brain /check 응답의 연도별 데이터를 yearly_metrics 테이블에 저장."""
         is_data = (detailed or {}).get('is') or {}
+        logging.debug(f"yearly_metrics keys for #{alpha_id}: {list(is_data.keys())}")
         yearly = []
         for key in ('stats', 'yearlyStats', 'annualStats', 'yearly', 'performance'):
             candidate = is_data.get(key)
             if isinstance(candidate, list) and candidate:
                 yearly = candidate
                 break
+        if not yearly:
+            logging.warning(f"yearly_metrics: 연도별 데이터 없음 #{alpha_id} — is_data keys: {list(is_data.keys())}")
         for y in yearly:
             year = y.get('year') or y.get('yr')
             if not year:
