@@ -124,5 +124,5 @@ Done: 다음 시뮬레이션 후 SELECT COUNT(*) FROM yearly_metrics > 0
 
 ### 미결 확인 사항
 
-- [ ] `delay` IQC 규정 확인 (고정 해제 가능한지)
+- [x] `delay` 고정 해제 완료 — 1~2 범위로 LLM이 결정
 - [ ] 기존 alpha의 settings_json 없음 → 스윕 기준값 default(decay=6, truncation=0.08) 사용

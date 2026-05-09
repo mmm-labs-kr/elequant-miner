@@ -7,13 +7,13 @@
 
 ## 시뮬레이션 설정
 - `region`: USA (고정)
-- `delay`: 1 (고정)
 - `unitHandling`: VERIFY (고정)
 - `language`: FASTEXPR (고정)
 
 아래 설정은 AI가 전략별로 판단해서 결정:
 | 파라미터 | 기본값 | 범위 |
 |---------|--------|------|
+| `delay` | 1 | 1~2 (정수) — 1: 전일 신호로 당일 거래(표준), 2: 2일 전 신호 |
 | `decay` | 6 | 0~512 (정수) |
 | `truncation` | 0.08 | 0.00~1.00 |
 | `universe` | TOP3000 | TOP3000/TOP2000/TOP1000/TOP500/TOP200/TOPSP500 |

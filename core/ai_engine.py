@@ -359,6 +359,10 @@ class GeminiEngine:
             data = json.loads(cleaned)
             code = self._clean(str(data.get('code', '')))
             settings = {}
+            if 'delay' in data:
+                v = int(data['delay'])
+                if v in (1, 2):
+                    settings['delay'] = v
             if 'decay' in data:
                 v = int(data['decay'])
                 if 1 <= v <= 512:
@@ -402,12 +406,13 @@ class GeminiEngine:
 === OUTPUT (JSON only, no markdown) ===
 Return a single JSON object with these keys:
 - "code": the FASTEXPR expression (required)
+- "delay": 1 (default, uses previous day signal) | 2 (uses 2-day-old signal, reduces noise for slow signals)
 - "decay": integer 1-512; short signals 3-10, medium 10-20, slow fundamental 20-40
 - "truncation": float 0.02-0.20; concentrated → 0.04-0.06, diffuse → 0.08-0.15
 - "universe": TOP3000 (default) | TOP2000 | TOP1000 | TOP500 | TOP200 | TOPSP500
 - "neutralization": SUBINDUSTRY (default) | INDUSTRY | SECTOR | MARKET | NONE
 
-Example: {"code": "rank(ts_mean(returns, 20))", "decay": 10, "truncation": 0.08, "universe": "TOP3000", "neutralization": "SUBINDUSTRY"}"""
+Example: {"code": "rank(ts_mean(returns, 20))", "delay": 1, "decay": 10, "truncation": 0.08, "universe": "TOP3000", "neutralization": "SUBINDUSTRY"}"""
 
         system_instruction = f"""\
 You are an expert Quantitative Researcher generating WorldQuant Brain FASTEXPR alpha factors.
