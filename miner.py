@@ -22,7 +22,6 @@ load_dotenv(ENV_FILE)
 
 console = Console()
 
-SWEEP_DECAY_MULT = [0.5, 0.7, 0.8, 1.5, 2.0, 3.0, 4.0]
 SWEEP_TRUNCATION = [0.02, 0.04, 0.06, 0.08, 0.10, 0.12, 0.15, 0.20]
 SWEEP_UNIVERSE   = ["TOP3000", "TOP2000", "TOP1000", "TOP500"]
 SWEEP_DELAY      = [1, 2]
@@ -209,7 +208,7 @@ class ElequantMiner:
                             logging.error(f"Slot HTTP {response.status_code}: {slot['sim_url']}")
                             self._update_alpha_status(slot['alpha_id'], 'TIMEOUT')
                             if slot.get('is_sweep') and self._sweep is not None:
-                                self._sweep['phase_idx'] += 1  # 타임아웃된 변형 건너뜀
+                                self._on_sweep_result(slot, 0)
                             slots.remove(slot)
                             continue
 
@@ -240,7 +239,7 @@ class ElequantMiner:
                             except Exception as proc_err:
                                 logging.error(f"Result processing error #{slot['alpha_id']}: {proc_err}")
                                 if slot.get('is_sweep') and self._sweep is not None:
-                                    self._sweep['phase_idx'] += 1  # 오류 시 변형 건너뜀
+                                    self._on_sweep_result(slot, 0)
                             finally:
                                 if passed:
                                     session_stats["passed"] += 1
@@ -276,7 +275,7 @@ class ElequantMiner:
 
                             self._update_alpha_status(slot['alpha_id'], f"FAILED: {error_msg[:50]}")
                             if slot.get('is_sweep') and self._sweep is not None:
-                                self._sweep['phase_idx'] += 1  # FAILED 변형 건너뜀
+                                self._on_sweep_result(slot, 0)
                             session_stats["failed"] += 1
                             slots.remove(slot)
 
@@ -975,31 +974,133 @@ What specific sub-expression changes would most improve the weakest metric?"""
             except (json.JSONDecodeError, TypeError):
                 pass
 
-        base_decay = max(1, int(base['decay']))
-        decay_vals = sorted(set(max(1, round(base_decay * m)) for m in SWEEP_DECAY_MULT))
+        base_decay  = max(1, int(base['decay']))
+        base_sharpe = candidate['sharpe'] or 0
+        p_lo = max(1, base_decay - 2)
+        p_hi = base_decay + 2
+        # center=1 or 2 → can't probe below, only probe up
+        probe_vals = [p_hi] if p_lo == base_decay else [p_lo, p_hi]
 
         self._sweep = {
             'parent_id':    candidate['id'],
             'parent_code':  candidate['code'],
             'base_settings': base,
-            'base_sharpe':  candidate['sharpe'] or 0,
+            'base_sharpe':  base_sharpe,
             'phase':        0,
             'phase_idx':    0,
             'no_improve':   0,
             'best_by_phase': {},
-            'best_overall': {'settings': base.copy(), 'sharpe': candidate['sharpe'] or 0},
+            'best_overall': {'settings': base.copy(), 'sharpe': base_sharpe},
             'phase_values': {
-                0: decay_vals,
                 1: SWEEP_TRUNCATION,
                 2: SWEEP_UNIVERSE,
                 3: SWEEP_DELAY,
+            },
+            'decay_state': {
+                'mode':          'probe',
+                'center':        base_decay,
+                'probe_vals':    probe_vals,
+                'probe_idx':     0,
+                'probe_results': {},
+                'direction':     None,
+                'current_val':   None,
+                'no_improve':    0,
+                'best':          {'val': base_decay, 'sharpe': base_sharpe},
             },
         }
         logging.info(
             f"🔍 Sweep start #{candidate['id']} "
             f"sharpe={candidate['sharpe']:.3f} "
-            f"decay_candidates={decay_vals}"
+            f"decay_probes={probe_vals}"
         )
+
+    def _decay_next_val(self) -> int | None:
+        """decay hill-climbing 다음 값 반환. 없으면 None (waiting or done)."""
+        ds = self._sweep['decay_state']
+        if ds['mode'] == 'probe':
+            if ds['probe_idx'] < len(ds['probe_vals']):
+                val = ds['probe_vals'][ds['probe_idx']]
+                ds['probe_idx'] += 1
+                return val
+            return None  # probes submitted, waiting for results
+        if ds['mode'] == 'directional':
+            val = ds['current_val']
+            if val is None or val < 1:
+                ds['mode'] = 'done'
+                return None
+            ds['current_val'] = None  # consumed; reset by _on_decay_result on result
+            return val
+        return None  # mode == 'done'
+
+    def _on_decay_result(self, slot, sharpe: float):
+        """decay phase 결과 처리: best 업데이트 + 방향 결정 / 조기 종료."""
+        sw = self._sweep
+        ds = sw['decay_state']
+        val = slot['sweep_param']
+
+        improved = sharpe > ds['best']['sharpe']
+        if improved:
+            ds['best'] = {'val': val, 'sharpe': sharpe}
+            sw['best_by_phase'][0] = {'param': 'decay', 'val': val, 'sharpe': sharpe}
+            if sharpe > sw['best_overall']['sharpe']:
+                sw['best_overall'] = {
+                    'settings': {**sw['best_overall']['settings'], 'decay': val},
+                    'sharpe': sharpe,
+                }
+            logging.info(f"🔍 Sweep ↑ decay={val} sharpe={sharpe:.3f}")
+        else:
+            logging.info(f"🔍 Sweep — decay={val} sharpe={sharpe:.3f}")
+
+        if ds['mode'] == 'probe':
+            ds['probe_results'][val] = sharpe
+            if len(ds['probe_results']) < len(ds['probe_vals']):
+                return  # still waiting for other probe result
+
+            # All probes in — decide direction
+            if len(ds['probe_vals']) == 1:
+                # Single probe (center was ≤ 2, only probed up)
+                if improved:
+                    ds['direction']   = +1
+                    ds['current_val'] = ds['probe_vals'][0] + 2
+                    ds['mode']        = 'directional'
+                    logging.info(f"🔍 Sweep decay direction=+1 (single probe improved)")
+                else:
+                    ds['mode'] = 'done'
+                    logging.info(f"🔍 Sweep decay: single probe no improvement → done")
+            else:
+                p_lo, p_hi = ds['probe_vals']
+                s_lo = ds['probe_results'][p_lo]
+                s_hi = ds['probe_results'][p_hi]
+                if s_lo > s_hi:
+                    next_lo = p_lo - 2
+                    if next_lo >= 1:
+                        ds['direction']   = -1
+                        ds['current_val'] = next_lo
+                        ds['mode']        = 'directional'
+                        logging.info(f"🔍 Sweep decay direction=-1 (lo:{s_lo:.3f} > hi:{s_hi:.3f})")
+                    else:
+                        ds['mode'] = 'done'
+                        logging.info(f"🔍 Sweep decay: lo better but can't go lower → done")
+                elif s_hi > s_lo:
+                    ds['direction']   = +1
+                    ds['current_val'] = p_hi + 2
+                    ds['mode']        = 'directional'
+                    logging.info(f"🔍 Sweep decay direction=+1 (hi:{s_hi:.3f} > lo:{s_lo:.3f})")
+                else:
+                    ds['mode'] = 'done'
+                    logging.info(f"🔍 Sweep decay: no gradient → done")
+
+        elif ds['mode'] == 'directional':
+            if improved:
+                ds['no_improve'] = 0
+            else:
+                ds['no_improve'] += 1
+            next_val = val + ds['direction'] * 2
+            if ds['no_improve'] >= 2 or next_val < 1:
+                ds['mode'] = 'done'
+                logging.info(f"🔍 Sweep decay directional done (no_improve={ds['no_improve']})")
+            else:
+                ds['current_val'] = next_val
 
     def _sweep_next(self) -> dict | None:
         """활성 스윕의 다음 변형을 제출하고 slot dict 반환. 완료/없음이면 None."""
@@ -1007,7 +1108,43 @@ What specific sub-expression changes would most improve the weakest metric?"""
             return None
         sw = self._sweep
 
-        # 현재 phase가 소진되면 다음 phase로
+        # Phase 0: adaptive decay hill-climbing
+        if sw['phase'] == 0:
+            decay_val = self._decay_next_val()
+            if decay_val is not None:
+                settings = sw['best_overall']['settings'].copy()
+                settings['decay'] = decay_val
+                alpha_id = self._save_alpha(sw['parent_code'], sw['parent_id'], source='sweep', settings=settings)
+                sim_url  = self.wq.simulate(sw['parent_code'], settings)
+                if not sim_url:
+                    logging.error(f"Sweep sim start failed (phase=0, decay={decay_val})")
+                    self._on_decay_result({'sweep_phase': 0, 'sweep_param': decay_val}, 0)
+                    return None
+                self._save_sim_url(alpha_id, sim_url)
+                return {
+                    'sim_url':         sim_url,
+                    'alpha_id':        alpha_id,
+                    'attempt':         3,
+                    'code':            sw['parent_code'],
+                    'parent_alpha':    None,
+                    'submitted_at':    time.time(),
+                    'last_heartbeat':  0,
+                    'last_progress':   -1,
+                    'is_sweep':        True,
+                    'sweep_phase':     0,
+                    'sweep_phase_idx': 0,
+                    'sweep_param':     decay_val,
+                }
+            if sw['decay_state']['mode'] == 'done':
+                sw['phase'] = 1
+                sw['phase_idx'] = 0
+                sw['no_improve'] = 0
+                logging.info("🔍 Sweep → phase 1: truncation")
+                # fall through to phases 1+
+            else:
+                return None  # waiting for probe results
+
+        # Phases 1-3: list-based scan
         while sw['phase'] < 4 and sw['phase_idx'] >= len(sw['phase_values'][sw['phase']]):
             sw['phase'] += 1
             sw['phase_idx'] = 0
@@ -1021,11 +1158,11 @@ What specific sub-expression changes would most improve the weakest metric?"""
                 return None
             return self._sweep_combo()
 
-        phase     = sw['phase']
-        idx       = sw['phase_idx']
-        param     = _SWEEP_PHASES[phase]
-        val       = sw['phase_values'][phase][idx]
-        settings  = sw['best_overall']['settings'].copy()
+        phase    = sw['phase']
+        idx      = sw['phase_idx']
+        param    = _SWEEP_PHASES[phase]
+        val      = sw['phase_values'][phase][idx]
+        settings = sw['best_overall']['settings'].copy()
         settings[param] = val
 
         # phase_idx 선점: 병렬 슬롯에서 같은 변형 중복 제출 방지
@@ -1102,8 +1239,12 @@ What specific sub-expression changes would most improve the weakest metric?"""
             self._finish_sweep()
             return
 
-        param = _SWEEP_PHASES[phase]
-        val   = slot['sweep_param']
+        if phase == 0:  # decay → adaptive hill-climbing 전용 핸들러
+            self._on_decay_result(slot, sharpe)
+            return
+
+        param    = _SWEEP_PHASES[phase]
+        val      = slot['sweep_param']
         cur_best = sw['best_by_phase'].get(phase, {}).get('sharpe', sw['base_sharpe'])
 
         if sharpe > cur_best:
@@ -1119,9 +1260,9 @@ What specific sub-expression changes would most improve the weakest metric?"""
             sw['no_improve'] += 1
             logging.info(f"🔍 Sweep — {param}={val} sharpe={sharpe:.3f} (no-improve={sw['no_improve']})")
 
-        # 조기 종료: decay/truncation/delay — 연속 2회, universe — 즉시 악화
+        # 조기 종료: truncation/delay — 연속 2회, universe — 즉시 악화
         phase_len = len(sw['phase_values'][phase])
-        if phase in (0, 1, 3) and sw['no_improve'] >= 2:
+        if phase in (1, 3) and sw['no_improve'] >= 2:
             sw['phase_idx'] = phase_len
             logging.info(f"🔍 Sweep early stop: {param}")
         elif phase == 2 and sharpe < sw['base_sharpe']:
@@ -1161,6 +1302,20 @@ What specific sub-expression changes would most improve the weakest metric?"""
             "UPDATE feedback SET sweep_summary = ? WHERE alpha_id = ?",
             (summary, parent_id)
         )
+
+        # Branch closing: 스윕 자식 중 합격이 없으면 LLM near-miss 재시도 차단
+        sweep_passed = conn.execute("""
+            SELECT COUNT(*) FROM alphas a
+            JOIN metrics m ON a.id = m.alpha_id
+            WHERE a.parent_id = ? AND a.source = 'sweep' AND m.success_flag = 1
+        """, (parent_id,)).fetchone()[0]
+        if sweep_passed == 0:
+            conn.execute(
+                "UPDATE alphas SET nearmiss_attempts = 15 WHERE id = ?",
+                (parent_id,)
+            )
+            logging.info(f"🔍 Sweep: no pass → branch closed (nearmiss_attempts=15) for #{parent_id}")
+
         conn.commit()
         conn.close()
         logging.info(f"🔍 Sweep complete for Alpha #{parent_id}")
