@@ -91,11 +91,12 @@ class DBManager:
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_yearly_alpha ON yearly_metrics (alpha_id)')
 
         for col, ddl in [
-            ("user_hypothesis", "INTEGER DEFAULT 0"),
-            ("hypothesis_text", "TEXT"),
-            ("sim_url",         "TEXT"),
-            ("wq_alpha_id",     "TEXT"),
-            ("source",          "TEXT DEFAULT 'miner'"),
+            ("user_hypothesis",   "INTEGER DEFAULT 0"),
+            ("hypothesis_text",   "TEXT"),
+            ("sim_url",           "TEXT"),
+            ("wq_alpha_id",       "TEXT"),
+            ("source",            "TEXT DEFAULT 'miner'"),
+            ("nearmiss_attempts", "INTEGER DEFAULT 0"),
         ]:
             try:
                 cursor.execute(f"ALTER TABLE alphas ADD COLUMN {col} {ddl}")

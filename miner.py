@@ -768,6 +768,7 @@ What specific sub-expression changes would most improve the weakest metric?"""
         정렬 우선순위:
           1. 실패 체크 수 오름차순 (1개 탈락 > 2개 탈락 > ...)
           2. 수치 기준 갭 합산 오름차순 (sharpe/fitness/turnover 기준 근접도)
+        nearmiss_attempts >= 15이면 선택 제외 (과착취 방지, DB 영속)
         """
         conn = sqlite3.connect(self.db.db_path)
         conn.row_factory = sqlite3.Row
@@ -795,18 +796,29 @@ What specific sub-expression changes would most improve the weakest metric?"""
               AND m.sharpe   > 0.6
               AND m.fitness  > 0.3
               AND m.turnover BETWEEN 0.1 AND 200
+              AND COALESCE(a.nearmiss_attempts, 0) < 15
             ORDER BY failed_count ASC, numeric_gap ASC
             LIMIT 10
         """)
         rows = cursor.fetchall()
-        conn.close()
 
         if not rows:
+            conn.close()
             return None
+
         candidates = [r for r in rows[:5] if r['id'] not in self._exhausted_parents]
         if not candidates:
-            candidates = rows[:5]  # exhausted 전부면 그냥 다시 허용
-        return random.choice(candidates)
+            conn.close()
+            return None  # 전부 소진 → explore로 전환
+
+        chosen = random.choice(candidates)
+        conn.execute(
+            "UPDATE alphas SET nearmiss_attempts = COALESCE(nearmiss_attempts, 0) + 1 WHERE id = ?",
+            (chosen['id'],)
+        )
+        conn.commit()
+        conn.close()
+        return chosen
 
     def _get_corr_rejected(self, limit: int = 4) -> list[str]:
         """SELF_CORRELATION 탈락 전략 코드 목록 반환 (B: anti-example용)."""
