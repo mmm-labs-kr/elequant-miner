@@ -122,7 +122,19 @@ Done: 다음 시뮬레이션 후 SELECT COUNT(*) FROM yearly_metrics > 0
 - 스윕 완료 후 LLM 프롬프트에 스윕 결과가 포함됨
 - explore 프롬프트에 연도별 요약이 포함됨
 
+### 구현 완료 (Phase 1)
+
+- `_save_alpha()` — source, settings_json 인자 추가
+- `_get_sweep_candidate()` — failed_count ≤ 2, numeric_gap < 0.5, sweep_done=0 필터
+- `_init_sweep()` — base settings 파싱, decay 변형값 생성
+- `_sweep_next()` — phase 소진 시 자동 다음 phase, combo 단계 처리
+- `_sweep_combo()` — 각 phase 최적값 조합 1회 제출
+- `_on_sweep_result()` — best 업데이트, 조기 종료 (decay/truncation/delay: 2연속, universe: 즉시)
+- `_finish_sweep()` — sweep_done=1 마킹
+- 슬롯 채우기 루프에 ① 활성 sweep, ② sweep 시작 우선순위 삽입
+
 ### 미결 확인 사항
 
 - [x] `delay` 고정 해제 완료 — 1~2 범위로 LLM이 결정
-- [ ] 기존 alpha의 settings_json 없음 → 스윕 기준값 default(decay=6, truncation=0.08) 사용
+- [x] 기존 alpha의 settings_json 없음 → _init_sweep()에서 default(decay=6, truncation=0.08) 사용
+- [ ] Phase 2: yearly_context.py 구현 (build_yearly_context → LLM 프롬프트 주입)

@@ -97,6 +97,8 @@ class DBManager:
             ("wq_alpha_id",       "TEXT"),
             ("source",            "TEXT DEFAULT 'miner'"),
             ("nearmiss_attempts", "INTEGER DEFAULT 0"),
+            ("sweep_done",        "INTEGER DEFAULT 0"),
+            ("settings_json",     "TEXT"),
         ]:
             try:
                 cursor.execute(f"ALTER TABLE alphas ADD COLUMN {col} {ddl}")

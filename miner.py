@@ -3,6 +3,7 @@ import time
 import logging
 import sqlite3
 import os
+import json
 from dotenv import load_dotenv
 from rich.console import Console
 from rich.logging import RichHandler
@@ -19,6 +20,12 @@ from utils.paths import DB_PATH, ENV_FILE, LOGS_DIR, DATA_DIR
 load_dotenv(ENV_FILE)
 
 console = Console()
+
+SWEEP_DECAY_MULT = [0.5, 0.7, 0.8, 1.5, 2.0, 3.0, 4.0]
+SWEEP_TRUNCATION = [0.02, 0.04, 0.06, 0.08, 0.10, 0.12, 0.15, 0.20]
+SWEEP_UNIVERSE   = ["TOP3000", "TOP2000", "TOP1000", "TOP500"]
+SWEEP_DELAY      = [1, 2]
+_SWEEP_PHASES    = {0: 'decay', 1: 'truncation', 2: 'universe', 3: 'delay'}
 
 # 파일은 타임스탬프 포함 전체 포맷, 터미널은 rich 렌더링
 file_handler = logging.FileHandler(LOGS_DIR / "miner.log", encoding='utf-8')
@@ -46,6 +53,7 @@ class ElequantMiner:
         self._gen_round = 0  # 0=PASSED발전, 1=near-miss개선, 2=신규탐색
         self._recent_codes: list[str] = []  # 최근 생성 코드 (다양성 유도용)
         self._exhausted_parents: set[int] = set()  # duplicate 반복 발생한 부모 ID
+        self._sweep: dict | None = None  # 활성 파라미터 스윕 상태
 
         self.criteria = {
             "sharpe": 1.25,
@@ -82,12 +90,43 @@ class ElequantMiner:
 
         try:
             while True:
-                # 빈 슬롯 채우기 — 3-mode 로테이션
-                # mode 0: PASSED 발전, mode 1: near-miss 개선, mode 2: 신규 탐색
+                # 빈 슬롯 채우기 — sweep 우선, 이후 3-mode 로테이션
                 while len(slots) < max_slots:
                     if time.time() < gen_retry_after:
                         break
 
+                    # ① 활성 sweep: 다음 파라미터 변형 제출 (LLM 없음)
+                    if self._sweep is not None:
+                        sweep_slot = self._sweep_next()
+                        if sweep_slot:
+                            slots.append(sweep_slot)
+                            session_stats["tried"] += 1
+                            logging.info(
+                                f"Slot {len(slots)}/3 | [bold]#{sweep_slot['alpha_id']}[/] "
+                                f"[dim]sweep {_SWEEP_PHASES.get(sweep_slot['sweep_phase'], 'combo')}="
+                                f"{sweep_slot['sweep_param']}[/]"
+                            )
+                            time.sleep(15)
+                            continue
+                        # sweep_next가 None 반환 = sim 실패 → LLM으로 fallback
+
+                    # ② 스윕 미실시 near-miss 후보 있으면 새 스윕 시작
+                    if self._sweep is None:
+                        sweep_cand = self._get_sweep_candidate()
+                        if sweep_cand:
+                            self._init_sweep(sweep_cand)
+                            sweep_slot = self._sweep_next()
+                            if sweep_slot:
+                                slots.append(sweep_slot)
+                                session_stats["tried"] += 1
+                                logging.info(
+                                    f"Slot {len(slots)}/3 | [bold]#{sweep_slot['alpha_id']}[/] "
+                                    f"[dim]sweep start[/]"
+                                )
+                                time.sleep(15)
+                                continue
+
+                    # ③/④ LLM 생성 (기존 3-mode 로테이션)
                     mode = self._gen_round % 3
                     self._gen_round += 1
 
@@ -130,7 +169,11 @@ class ElequantMiner:
                         continue
 
                     self.dedup.add(alpha_code)
-                    alpha_id = self._save_alpha(alpha_code, parent_alpha['id'] if parent_alpha else None)
+                    alpha_id = self._save_alpha(
+                        alpha_code,
+                        parent_alpha['id'] if parent_alpha else None,
+                        settings=alpha_settings or None,
+                    )
                     sim_url = self.wq.simulate(alpha_code, alpha_settings or None)
 
                     if sim_url:
@@ -164,6 +207,8 @@ class ElequantMiner:
                         if response.status_code != 200:
                             logging.error(f"Slot HTTP {response.status_code}: {slot['sim_url']}")
                             self._update_alpha_status(slot['alpha_id'], 'TIMEOUT')
+                            if slot.get('is_sweep') and self._sweep is not None:
+                                self._sweep['phase_idx'] += 1  # 타임아웃된 변형 건너뜀
                             slots.remove(slot)
                             continue
 
@@ -182,8 +227,19 @@ class ElequantMiner:
                                     results['detailed'] = detailed
                                     results['_code'] = slot['code']
                                     passed = self._process_results(slot['alpha_id'], results)
+
+                                if slot.get('is_sweep') and self._sweep is not None:
+                                    conn = sqlite3.connect(self.db.db_path)
+                                    row = conn.execute(
+                                        "SELECT sharpe FROM metrics WHERE alpha_id = ?",
+                                        (slot['alpha_id'],)
+                                    ).fetchone()
+                                    conn.close()
+                                    self._on_sweep_result(slot, (row[0] or 0) if row else 0)
                             except Exception as proc_err:
                                 logging.error(f"Result processing error #{slot['alpha_id']}: {proc_err}")
+                                if slot.get('is_sweep') and self._sweep is not None:
+                                    self._sweep['phase_idx'] += 1  # 오류 시 변형 건너뜀
                             finally:
                                 if passed:
                                     session_stats["passed"] += 1
@@ -218,6 +274,8 @@ class ElequantMiner:
                                         continue
 
                             self._update_alpha_status(slot['alpha_id'], f"FAILED: {error_msg[:50]}")
+                            if slot.get('is_sweep') and self._sweep is not None:
+                                self._sweep['phase_idx'] += 1  # FAILED 변형 건너뜀
                             session_stats["failed"] += 1
                             slots.remove(slot)
 
@@ -547,14 +605,16 @@ Return ONLY the raw FASTEXPR expression.
             self._recent_codes = self._recent_codes[-15:]  # 최근 15개만 유지
         return result
 
-    def _save_alpha(self, code, parent_id):
+    def _save_alpha(self, code, parent_id, source='miner', settings=None):
         conn = sqlite3.connect(self.db.db_path)
         cursor = conn.cursor()
         user_hypo = 1 if self.user_directive else 0
+        settings_json = json.dumps(settings) if settings else None
         cursor.execute(
-            "INSERT INTO alphas (code, parent_id, user_hypothesis, hypothesis_text) "
-            "VALUES (?, ?, ?, ?)",
-            (code, parent_id, user_hypo, self.user_directive)
+            "INSERT INTO alphas "
+            "(code, parent_id, user_hypothesis, hypothesis_text, source, settings_json) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (code, parent_id, user_hypo, self.user_directive, source, settings_json)
         )
         alpha_id = cursor.lastrowid
         conn.commit()
@@ -846,6 +906,219 @@ What specific sub-expression changes would most improve the weakest metric?"""
         ).fetchall()
         conn.close()
         return [r[0] for r in rows]
+
+    # ──────────────────────────────── Sweep ────────────────────────────────
+
+    def _get_sweep_candidate(self):
+        """스윕 미실시 near-miss 후보 반환 (failed_count ≤ 2, numeric_gap < 0.5, sweep_done=0)."""
+        conn = sqlite3.connect(self.db.db_path)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("""
+            SELECT * FROM (
+                SELECT a.id, a.code, a.settings_json,
+                       m.sharpe, m.fitness, m.turnover, m.failed_checks,
+                       CASE
+                         WHEN m.failed_checks IS NULL OR m.failed_checks = '' THEN 0
+                         ELSE (LENGTH(m.failed_checks) - LENGTH(REPLACE(m.failed_checks, ',', ''))) + 1
+                       END AS failed_count,
+                       (
+                         MAX(0.0, 1.25 - COALESCE(m.sharpe,  0)) / 1.25 +
+                         MAX(0.0, 1.0  - COALESCE(m.fitness, 0)) / 1.0  +
+                         CASE
+                           WHEN m.turnover BETWEEN 1 AND 70 THEN 0.0
+                           WHEN m.turnover < 1  THEN (1 - m.turnover) / 1.0
+                           ELSE                      (m.turnover - 70) / 70.0
+                         END
+                       ) AS numeric_gap
+                FROM alphas a
+                JOIN metrics m ON a.id = m.alpha_id
+                WHERE a.status = 'REJECTED'
+                  AND COALESCE(a.sweep_done, 0) = 0
+                  AND m.sharpe   > 0.6
+                  AND m.fitness  > 0.3
+                  AND m.turnover BETWEEN 0.1 AND 200
+            )
+            WHERE failed_count <= 2 AND numeric_gap < 0.5
+            ORDER BY failed_count ASC, numeric_gap ASC
+            LIMIT 1
+        """).fetchone()
+        conn.close()
+        return row
+
+    def _init_sweep(self, candidate):
+        """후보 alpha에 대해 파라미터 스윕 상태 초기화."""
+        base = {'decay': 6, 'truncation': 0.08, 'universe': 'TOP3000', 'delay': 1}
+        if candidate['settings_json']:
+            try:
+                stored = json.loads(candidate['settings_json'])
+                base.update({k: v for k, v in stored.items() if k in base})
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        base_decay = max(1, int(base['decay']))
+        decay_vals = sorted(set(max(1, round(base_decay * m)) for m in SWEEP_DECAY_MULT))
+
+        self._sweep = {
+            'parent_id':    candidate['id'],
+            'parent_code':  candidate['code'],
+            'base_settings': base,
+            'base_sharpe':  candidate['sharpe'] or 0,
+            'phase':        0,
+            'phase_idx':    0,
+            'no_improve':   0,
+            'best_by_phase': {},
+            'best_overall': {'settings': base.copy(), 'sharpe': candidate['sharpe'] or 0},
+            'phase_values': {
+                0: decay_vals,
+                1: SWEEP_TRUNCATION,
+                2: SWEEP_UNIVERSE,
+                3: SWEEP_DELAY,
+            },
+        }
+        logging.info(
+            f"🔍 Sweep start #{candidate['id']} "
+            f"sharpe={candidate['sharpe']:.3f} "
+            f"decay_candidates={decay_vals}"
+        )
+
+    def _sweep_next(self) -> dict | None:
+        """활성 스윕의 다음 변형을 제출하고 slot dict 반환. 완료/없음이면 None."""
+        if self._sweep is None:
+            return None
+        sw = self._sweep
+
+        # 현재 phase가 소진되면 다음 phase로
+        while sw['phase'] < 4 and sw['phase_idx'] >= len(sw['phase_values'][sw['phase']]):
+            sw['phase'] += 1
+            sw['phase_idx'] = 0
+            sw['no_improve'] = 0
+            logging.info(f"🔍 Sweep → phase {sw['phase']}: {_SWEEP_PHASES.get(sw['phase'], 'combo')}")
+
+        # 모든 phase 완료 → combo 제출
+        if sw['phase'] >= 4:
+            if sw['phase'] > 4:
+                self._finish_sweep()
+                return None
+            return self._sweep_combo()
+
+        phase     = sw['phase']
+        idx       = sw['phase_idx']
+        param     = _SWEEP_PHASES[phase]
+        val       = sw['phase_values'][phase][idx]
+        settings  = sw['best_overall']['settings'].copy()
+        settings[param] = val
+
+        # phase_idx 선점: 병렬 슬롯에서 같은 변형 중복 제출 방지
+        sw['phase_idx'] += 1
+
+        alpha_id = self._save_alpha(sw['parent_code'], sw['parent_id'], source='sweep', settings=settings)
+        sim_url  = self.wq.simulate(sw['parent_code'], settings)
+        if not sim_url:
+            logging.error(f"Sweep sim start failed (phase={phase}, {param}={val})")
+            return None
+
+        self._save_sim_url(alpha_id, sim_url)
+        return {
+            'sim_url':        sim_url,
+            'alpha_id':       alpha_id,
+            'attempt':        3,
+            'code':           sw['parent_code'],
+            'parent_alpha':   None,
+            'submitted_at':   time.time(),
+            'last_heartbeat': 0,
+            'last_progress':  -1,
+            'is_sweep':       True,
+            'sweep_phase':    phase,
+            'sweep_phase_idx': idx,
+            'sweep_param':    val,
+        }
+
+    def _sweep_combo(self) -> dict | None:
+        """모든 phase 최적값 조합 1회 제출."""
+        sw = self._sweep
+        if not sw['best_by_phase']:
+            logging.info("🔍 Sweep: no improvements → skip combo")
+            self._finish_sweep()
+            return None
+
+        best_settings = sw['base_settings'].copy()
+        for r in sw['best_by_phase'].values():
+            best_settings[r['param']] = r['val']
+
+        sw['phase'] = 5  # combo 제출 완료 마킹
+
+        alpha_id = self._save_alpha(sw['parent_code'], sw['parent_id'], source='sweep', settings=best_settings)
+        sim_url  = self.wq.simulate(sw['parent_code'], best_settings)
+        if not sim_url:
+            self._finish_sweep()
+            return None
+
+        self._save_sim_url(alpha_id, sim_url)
+        settings_str = ", ".join(f"{k}={v}" for k, v in best_settings.items())
+        logging.info(f"🔍 Sweep combo #{alpha_id} | {settings_str}")
+        return {
+            'sim_url':        sim_url,
+            'alpha_id':       alpha_id,
+            'attempt':        3,
+            'code':           sw['parent_code'],
+            'parent_alpha':   None,
+            'submitted_at':   time.time(),
+            'last_heartbeat': 0,
+            'last_progress':  -1,
+            'is_sweep':       True,
+            'sweep_phase':    4,
+            'sweep_phase_idx': 0,
+            'sweep_param':    best_settings,
+        }
+
+    def _on_sweep_result(self, slot, sharpe: float):
+        """스윕 결과 처리: best 업데이트 + 조기 종료 판단."""
+        if self._sweep is None:
+            return
+        sw    = self._sweep
+        phase = slot['sweep_phase']
+
+        if phase >= 4:  # combo 완료
+            self._finish_sweep()
+            return
+
+        param = _SWEEP_PHASES[phase]
+        val   = slot['sweep_param']
+        cur_best = sw['best_by_phase'].get(phase, {}).get('sharpe', sw['base_sharpe'])
+
+        if sharpe > cur_best:
+            sw['best_by_phase'][phase] = {'param': param, 'val': val, 'sharpe': sharpe}
+            sw['no_improve'] = 0
+            if sharpe > sw['best_overall']['sharpe']:
+                sw['best_overall'] = {
+                    'settings': {**sw['best_overall']['settings'], param: val},
+                    'sharpe':   sharpe,
+                }
+            logging.info(f"🔍 Sweep ↑ {param}={val} sharpe={sharpe:.3f}")
+        else:
+            sw['no_improve'] += 1
+            logging.info(f"🔍 Sweep — {param}={val} sharpe={sharpe:.3f} (no-improve={sw['no_improve']})")
+
+        # 조기 종료: decay/truncation/delay — 연속 2회, universe — 즉시 악화
+        phase_len = len(sw['phase_values'][phase])
+        if phase in (0, 1, 3) and sw['no_improve'] >= 2:
+            sw['phase_idx'] = phase_len
+            logging.info(f"🔍 Sweep early stop: {param}")
+        elif phase == 2 and sharpe < sw['base_sharpe']:
+            sw['phase_idx'] = phase_len
+            logging.info(f"🔍 Sweep early stop: universe (worsened)")
+
+    def _finish_sweep(self):
+        """스윕 완료: sweep_done=1 마킹 후 상태 초기화."""
+        if self._sweep is None:
+            return
+        parent_id = self._sweep['parent_id']
+        conn = sqlite3.connect(self.db.db_path)
+        conn.execute("UPDATE alphas SET sweep_done = 1 WHERE id = ?", (parent_id,))
+        conn.commit()
+        conn.close()
+        logging.info(f"🔍 Sweep complete for Alpha #{parent_id}")
+        self._sweep = None
 
 
 if __name__ == "__main__":
